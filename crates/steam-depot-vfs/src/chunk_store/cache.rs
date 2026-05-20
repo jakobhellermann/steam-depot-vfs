@@ -33,6 +33,7 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
 }
 
 impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
+    #[tracing::instrument(name = "fs_cache.get", skip(self), fields(%sha))]
     async fn get(&self, sha: ChunkHash) -> Result<Bytes> {
         let path = self.path_for(sha);
         if let Ok(bytes) = tokio::fs::read(&path).await {

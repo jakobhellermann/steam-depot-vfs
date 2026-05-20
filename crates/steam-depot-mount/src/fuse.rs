@@ -45,6 +45,7 @@ impl<C: ChunkStore + 'static> AsyncFilesystem for FuseFs<C> {
         parent: INodeNo,
         name: &OsStr,
     ) -> experimental::Result<LookupResponse> {
+        let _span = tracing::info_span!("fuse.lookup", parent = parent.0, ?name).entered();
         let name = name.to_str().ok_or(Errno::ENOENT)?;
         let tree = self.tree.read();
         let (_ino, attr) = resolve_child(&tree, parent, name).ok_or(Errno::ENOENT)?;
@@ -57,6 +58,7 @@ impl<C: ChunkStore + 'static> AsyncFilesystem for FuseFs<C> {
         ino: INodeNo,
         _fh: Option<FileHandle>,
     ) -> experimental::Result<GetAttrResponse> {
+        let _span = tracing::info_span!("fuse.getattr", ino = ino.0).entered();
         let tree = self.tree.read();
         let attr = attr_for(&tree, ino).ok_or(Errno::ENOENT)?;
         Ok(GetAttrResponse::new(TTL, attr))
@@ -70,6 +72,7 @@ impl<C: ChunkStore + 'static> AsyncFilesystem for FuseFs<C> {
         offset: u64,
         mut builder: DirEntListBuilder<'_>,
     ) -> experimental::Result<()> {
+        let _span = tracing::info_span!("fuse.readdir", ino = ino.0, offset).entered();
         // Snapshot the entries to release the lock before calling into
         // `builder.add` (which is sync but we don't want to hold the
         // RwLock across the whole iteration regardless).
@@ -97,6 +100,7 @@ impl<C: ChunkStore + 'static> AsyncFilesystem for FuseFs<C> {
         Ok(())
     }
 
+    #[tracing::instrument(name = "fuse.read", skip(self, _ctx, _fh, _flags, _lock, out_data), fields(ino = ino.0))]
     async fn read(
         &self,
         _ctx: &RequestContext,

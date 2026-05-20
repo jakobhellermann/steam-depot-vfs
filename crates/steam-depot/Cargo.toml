@@ -21,4 +21,5 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "io-util", "signal"] }
 toml.workspace = true
 tracing.workspace = true
+tracing-perfetto = "0.1.5"
 tracing-subscriber.workspace = true

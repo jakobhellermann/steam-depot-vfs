@@ -70,6 +70,7 @@ impl<A: SteamAuth> CdnChunkStore<A> {
 }
 
 impl<A: SteamAuth> ChunkStore for CdnChunkStore<A> {
+    #[tracing::instrument(name = "cdn.get", skip(self), fields(%sha))]
     async fn get(&self, sha: ChunkHash) -> Result<Bytes> {
         let chunk = self
             .chunk_index
