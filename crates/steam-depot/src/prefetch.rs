@@ -15,11 +15,12 @@ use steam_depot_vfs::{ChunkHash, DepotStore, SteamAuth};
 use crate::auth::Auth;
 use crate::config::Config;
 
-/// Default max concurrent in-flight CDN fetches. DepotDownloader uses
-/// 8 (or 25 with `-validate-all`); 16 is a middle ground that
-/// noticeably improves throughput on most connections without hammering
-/// Steam.
-const DEFAULT_PARALLELISM: usize = 16;
+/// Default max concurrent in-flight CDN fetches. Empirically (with
+/// HTTP/2 and per-request CDN round-robin) sweeping 16/24/32/40 showed
+/// a clean peak at 32: 38.7 / 44.6 / 48.0 / 44.3 MiB/s respectively.
+/// Past 32 we start contending for CDN-side per-IP fairness and
+/// throughput regresses.
+const DEFAULT_PARALLELISM: usize = 32;
 
 pub fn run(cfg: Config, parallelism: Option<usize>, seconds: Option<u64>) -> Result<()> {
     let parallelism = parallelism.unwrap_or(DEFAULT_PARALLELISM).max(1);
