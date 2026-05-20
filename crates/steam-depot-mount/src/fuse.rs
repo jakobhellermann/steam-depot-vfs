@@ -139,15 +139,14 @@ impl<C: ChunkStore + 'static> AsyncFilesystem for FuseFs<C> {
             }
             file.path.clone()
         };
-        let bytes = entry
+        entry
             .snapshot
-            .read(&path, offset, size as u64)
+            .read_into(&path, offset, size as u64, out_data)
             .await
             .map_err(|e| {
                 tracing::warn!(path = %path, offset, size, %e, "read failed");
                 Errno::EIO
             })?;
-        out_data.extend_from_slice(&bytes);
         Ok(())
     }
 }

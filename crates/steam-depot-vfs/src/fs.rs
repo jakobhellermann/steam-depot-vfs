@@ -142,6 +142,24 @@ impl<C: ChunkStore> DepotSnapshot<C> {
     /// Read up to `len` bytes from `path` starting at `offset`. Returns fewer
     /// bytes than requested only at EOF.
     pub async fn read(&self, path: &str, offset: u64, len: u64) -> Result<Bytes> {
+        let mut out = Vec::new();
+        self.read_into(path, offset, len, &mut out).await?;
+        Ok(Bytes::from(out))
+    }
+
+    /// Read into a caller-provided buffer. Avoids the allocate-then-copy
+    /// that the `Bytes`-returning [`read`](Self::read) needs when the
+    /// caller (e.g. FUSE) already has a buffer to fill.
+    ///
+    /// Bytes are *appended* (existing contents of `out` are preserved);
+    /// call `out.clear()` first if you want replace semantics.
+    pub async fn read_into(
+        &self,
+        path: &str,
+        offset: u64,
+        len: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let p = strip_leading_slash(path);
         let idx = *self
             .by_path
@@ -159,7 +177,7 @@ impl<C: ChunkStore> DepotSnapshot<C> {
         }
         let end = (offset + len).min(f.size);
         let want_len = (end - offset) as usize;
-        tracing::info!(
+        tracing::trace!(
             path = %f.path,
             offset,
             len = want_len,
@@ -167,7 +185,7 @@ impl<C: ChunkStore> DepotSnapshot<C> {
             chunks = f.chunks.len(),
             "reading file"
         );
-        let mut out = Vec::with_capacity(want_len);
+        out.reserve(want_len);
 
         // `DepotFile::chunks` is sorted by offset (enforced upstream), so we
         // can `break` once we're past `end`.
@@ -187,7 +205,7 @@ impl<C: ChunkStore> DepotSnapshot<C> {
             let slice_end = (end.min(c_end) - c_start) as usize;
             out.extend_from_slice(&bytes[slice_start..slice_end]);
         }
-        Ok(Bytes::from(out))
+        Ok(())
     }
 }
 
