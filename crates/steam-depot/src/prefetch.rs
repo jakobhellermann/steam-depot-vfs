@@ -44,7 +44,7 @@ pub fn run(cfg: Config, parallelism: Option<usize>, seconds: Option<u64>) -> Res
         tracing::info!(cached_chunks = cached.len(), "scanned chunk cache");
 
         for m in &cfg.manifests {
-            tracing::info!(
+            tracing::debug!(
                 app_id = m.app_id,
                 depot_id = m.depot_id,
                 gid = m.gid,
@@ -128,7 +128,7 @@ where
     // matches the real download progress without making the rate look
     // like 1.3 GiB/s for the first second.
     let total_bytes = new_bytes + skipped_bytes;
-    tracing::info!(
+    tracing::debug!(
         manifest_id = manifest.manifest_id,
         chunks = total_chunks,
         bytes_compressed = total_bytes,
@@ -137,7 +137,9 @@ where
         "prefetching depot",
     );
     if total_chunks == 0 {
-        tracing::info!(manifest_id = manifest.manifest_id, "nothing to fetch");
+        // Stay silent — the per-manifest summary line at the end of a
+        // run is enough; a "nothing to fetch" for every manifest in a
+        // mostly-cached config is just noise.
         return Ok(());
     }
 
@@ -206,6 +208,12 @@ where
         }
     });
     let mut interrupted = false;
+    // Hide the bar once we've stopped submitting new work. The
+    // remaining in-flight fetches still need to be awaited, but
+    // letting the bar sit at 100% while the rate visibly drops is
+    // misleading. The actual completion stats get a final println
+    // below after everything settles.
+    let mut bar_finished = false;
     loop {
         tokio::select! {
             biased;
@@ -237,8 +245,19 @@ where
                         tracing::warn!(%sha, %e, "chunk fetch failed");
                     }
                 }
-                if !interrupted && let Some((sha, size)) = iter.next() {
-                    in_flight.push(spawn_one(sha, size));
+                if !interrupted {
+                    match iter.next() {
+                        Some((sha, size)) => in_flight.push(spawn_one(sha, size)),
+                        None if !bar_finished => {
+                            // All work submitted. The remaining
+                            // in-flight tasks will finish on their own;
+                            // hide the bar so its rate display doesn't
+                            // mislead during the drain.
+                            pb.finish_and_clear();
+                            bar_finished = true;
+                        }
+                        None => {}
+                    }
                 }
             }
         }

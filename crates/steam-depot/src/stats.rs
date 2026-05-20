@@ -1,16 +1,74 @@
 // TODO(ai-review): review for correctness/style
 //! `stats` subcommand: walk the local chunk cache and report per-manifest
-//! download progress. Purely offline — no Steam roundtrips.
+//! download progress.
+//!
+//! Mostly offline. The one network step is fetching any manifests that
+//! aren't yet on disk — without them we can't know how many chunks the
+//! manifest references. Subsequent runs are fully offline.
 
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use steam_depot_vfs::{ChunkHash, DepotStore};
+use steam_depot_vfs::{ChunkHash, DepotStore, SteamAuth};
 
+use crate::auth::Auth;
 use crate::config::Config;
 
 pub fn run(cfg: &Config) -> Result<()> {
     let store = DepotStore::new(cfg.store_root.clone());
+
+    // First pass: see which configured manifests are missing on disk
+    // and only spin up a runtime + auth if at least one is missing.
+    let missing: Vec<&crate::config::Manifest> = cfg
+        .manifests
+        .iter()
+        .filter(|m| {
+            store
+                .load_cached_manifest(m.depot_id, m.gid)
+                .ok()
+                .flatten()
+                .is_none()
+        })
+        .collect();
+    if !missing.is_empty() {
+        tracing::info!(count = missing.len(), "fetching missing manifests");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let auth = Auth::prepare(cfg.steam.account.clone(), cfg.steam.password.clone())
+                .await
+                .context("preparing auth for manifest fetch")?;
+            // Force the connection up front so it isn't repeated by
+            // each parallel fetch.
+            auth.resolve().await?;
+
+            let mut in_flight: FuturesUnordered<_> = missing
+                .iter()
+                .map(|m| {
+                    let store = &store;
+                    let auth = auth.clone();
+                    async move {
+                        store
+                            .open_depot_manifest(auth, m.app_id, m.depot_id, m.gid, &m.branch)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "fetching manifest {} for depot {} (branch {:?})",
+                                    m.gid, m.depot_id, m.branch
+                                )
+                            })
+                    }
+                })
+                .collect();
+            while let Some(res) = in_flight.next().await {
+                res?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+
     let cache = scan_chunks(&store)?;
     println!(
         "chunk cache: {} files, {} on disk",
@@ -29,6 +87,12 @@ pub fn run(cfg: &Config) -> Result<()> {
         "{:<10}  {:<23}  {:<15}  {:<6}  manifest",
         "uncompr", "bytes (fetched/total)", "chunks", "%",
     );
+    // Aggregated counters: dedup across all configured manifests so
+    // chunks shared between manifest versions only count once.
+    let mut all_chunks: std::collections::HashMap<ChunkHash, u32> =
+        std::collections::HashMap::new();
+    let mut all_uncompr_per_manifest: u64 = 0;
+    let mut missing_count: u64 = 0;
     for m in &cfg.manifests {
         let Some(manifest) = store
             .load_cached_manifest(m.depot_id, m.gid)
@@ -40,9 +104,10 @@ pub fn run(cfg: &Config) -> Result<()> {
             })?
         else {
             println!(
-                "{:<10}  {:<23}  {:<15}  {:<6}  {}/{}/{} (manifest not cached)",
+                "{:<10}  {:<23}  {:<15}  {:<6}  {}/{}/{:>20} (manifest not cached)",
                 "-", "-", "-", "-", m.app_id, m.depot_id, m.gid,
             );
+            missing_count += 1;
             continue;
         };
         let mut total_uncompr: u64 = 0;
@@ -63,15 +128,18 @@ pub fn run(cfg: &Config) -> Result<()> {
                     fetched_compr += c.size_compressed as u64;
                     fetched_chunks += 1;
                 }
+                // Aggregate across all manifests, deduplicated by sha.
+                all_chunks.entry(c.sha).or_insert(c.size_compressed);
             }
         }
+        all_uncompr_per_manifest += total_uncompr;
         let pct = if total_compr == 0 {
             100.0
         } else {
             100.0 * fetched_compr as f64 / total_compr as f64
         };
         println!(
-            "{:<10}  {:<23}  {:<15}  {:<6}  {}/{}/{}",
+            "{:<10}  {:<23}  {:<15}  {:<6}  {}/{}/{:<20}",
             human_bytes(total_uncompr),
             format!(
                 "{}/{}",
@@ -85,6 +153,49 @@ pub fn run(cfg: &Config) -> Result<()> {
             m.gid,
         );
     }
+
+    // Aggregated summary across all configured manifests. The "total"
+    // here is dedup'd across manifests (chunks shared between
+    // manifest versions count once), so it represents the real disk
+    // footprint to fully cache the whole config.
+    let mut all_compr: u64 = 0;
+    let mut all_fetched: u64 = 0;
+    let mut all_fetched_chunks: u64 = 0;
+    for (sha, &size) in &all_chunks {
+        all_compr += size as u64;
+        if cache.shas.contains(sha) {
+            all_fetched += size as u64;
+            all_fetched_chunks += 1;
+        }
+    }
+    let byte_pct = if all_compr == 0 {
+        100.0
+    } else {
+        100.0 * all_fetched as f64 / all_compr as f64
+    };
+    let chunk_pct = if all_chunks.is_empty() {
+        100.0
+    } else {
+        100.0 * all_fetched_chunks as f64 / all_chunks.len() as f64
+    };
+    println!();
+    let missing_note = if missing_count == 0 {
+        String::new()
+    } else {
+        format!(" ({missing_count} missing)")
+    };
+    println!(
+        "total across {} manifests{}: {} uncompr (sum), {}/{} ({:.1}%) compressed, {}/{} ({:.1}%) chunks",
+        cfg.manifests.len(),
+        missing_note,
+        human_bytes(all_uncompr_per_manifest),
+        human_bytes(all_fetched),
+        human_bytes(all_compr),
+        byte_pct,
+        all_fetched_chunks,
+        all_chunks.len(),
+        chunk_pct,
+    );
     Ok(())
 }
 

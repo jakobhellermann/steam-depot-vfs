@@ -49,7 +49,7 @@ impl<C: ChunkStore> DepotSnapshot<C> {
             let parent = parent_of(&f.path).unwrap_or("").to_string();
             children.entry(parent).or_default().push(i);
         }
-        tracing::info!(
+        tracing::debug!(
             manifest_id = manifest.manifest_id,
             depot_id = manifest.depot_id,
             files = manifest.files.len(),

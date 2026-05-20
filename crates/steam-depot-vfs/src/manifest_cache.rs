@@ -50,7 +50,7 @@ impl ManifestCache {
             Err(e) => return Err(e.into()),
         };
         let cached: CachedManifest = postcard::from_bytes(&bytes)?;
-        tracing::info!(
+        tracing::debug!(
             depot_id,
             manifest_id,
             bytes = bytes.len(),

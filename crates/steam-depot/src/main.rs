@@ -91,7 +91,11 @@ fn main() -> anyhow::Result<()> {
         // keeping the bar intact. Warn-only for chunk_store keeps the
         // output focused on progress and real failures.
         Cmd::Prefetch { .. } => "info,steam_depot_vfs::chunk_store=warn,fuser=error",
-        Cmd::Stats | Cmd::Prune { .. } => "warn",
+        // `stats` is mostly silent (its output is the table it prints
+        // on stdout), but we want to see the one-line manifest-fetch
+        // note on the rare runs where it goes online.
+        Cmd::Stats => "warn,steam_depot::stats=info",
+        Cmd::Prune { .. } => "warn",
     };
     // Display filter is per-fmt-layer so we can keep the user-facing
     // output sparse without starving the perfetto trace of spans.
