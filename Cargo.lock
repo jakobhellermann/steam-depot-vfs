@@ -2548,6 +2548,7 @@ dependencies = [
  "indicatif",
  "serde",
  "serde_json",
+ "sha1",
  "steam-depot-mount",
  "steam-depot-vfs",
  "steam-vent",

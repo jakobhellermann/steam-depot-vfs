@@ -22,6 +22,12 @@ use crate::config::Config;
 /// throughput regresses.
 const DEFAULT_PARALLELISM: usize = 32;
 
+/// How many times the prefetch-then-verify loop runs before giving up
+/// on remaining mismatches. Two attempts catches transient page-cache
+/// loss; a stubborn third pass usually means something else is wrong
+/// (e.g. the CDN keeps serving bad bytes for one specific chunk).
+const MAX_REFETCH_ATTEMPTS: usize = 3;
+
 pub fn run(cfg: Config, parallelism: Option<usize>, seconds: Option<u64>) -> Result<()> {
     let parallelism = parallelism.unwrap_or(DEFAULT_PARALLELISM).max(1);
     let max_duration = seconds.map(std::time::Duration::from_secs);
@@ -37,29 +43,87 @@ pub fn run(cfg: Config, parallelism: Option<usize>, seconds: Option<u64>) -> Res
         auth.resolve().await?;
         let store = DepotStore::new(cfg.store_root.clone());
 
-        // Walk the chunk cache once to find what's already on disk.
-        // We use this to make the progress bar honest: cached chunks
-        // are skipped entirely rather than counted as 1.3 GB/s reads.
-        let cached = scan_chunks_on_disk(&store.chunks_root())?;
-        tracing::info!(cached_chunks = cached.len(), "scanned chunk cache");
-
-        for m in &cfg.manifests {
-            tracing::debug!(
-                app_id = m.app_id,
-                depot_id = m.depot_id,
-                gid = m.gid,
-                branch = m.branch,
-                "opening manifest",
+        // Loop: fetch missing → verify everything → delete mismatches →
+        // refetch (those mismatches now look "missing" to the next
+        // pass). Two passes is enough in practice; the third only runs
+        // for actually-stubborn corruption.
+        for attempt in 0..MAX_REFETCH_ATTEMPTS {
+            let cached = scan_chunks_on_disk(&store.chunks_root())?;
+            tracing::info!(
+                attempt = attempt + 1,
+                cached_chunks = cached.len(),
+                "scanned chunk cache",
             );
-            let snapshot = store
-                .open_depot_manifest(auth.clone(), m.app_id, m.depot_id, m.gid, &m.branch)
-                .await?;
-            // `Arc` so each spawned per-chunk task can hold a cheap
-            // clone of the snapshot without borrowing across the spawn.
-            let snapshot = Arc::new(snapshot);
-            prefetch_snapshot(snapshot, &cached, parallelism, max_duration).await?;
+
+            for m in &cfg.manifests {
+                tracing::debug!(
+                    app_id = m.app_id,
+                    depot_id = m.depot_id,
+                    gid = m.gid,
+                    branch = m.branch,
+                    "opening manifest",
+                );
+                let snapshot = store
+                    .open_depot_manifest(auth.clone(), m.app_id, m.depot_id, m.gid, &m.branch)
+                    .await?;
+                // `Arc` so each spawned per-chunk task can hold a cheap
+                // clone of the snapshot without borrowing across the spawn.
+                let snapshot = Arc::new(snapshot);
+                prefetch_snapshot(snapshot, &cached, parallelism, max_duration).await?;
+            }
+
+            // Bounded runs (`--seconds`) skip verify: the user
+            // explicitly asked for a partial run, full-cache validation
+            // would defeat the bound.
+            if max_duration.is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+
+            let post = scan_chunks_on_disk(&store.chunks_root())?;
+            let report = tokio::task::spawn_blocking({
+                let root = store.chunks_root();
+                let shas = post.clone();
+                move || crate::verify::verify_cache(&root, &shas)
+            })
+            .await??;
+            tracing::info!(
+                ok = report.ok,
+                mismatched = report.mismatched.len(),
+                errored = report.errored.len(),
+                elapsed_secs = report.elapsed.as_secs_f64(),
+                throughput = format!(
+                    "{}/s",
+                    human_bytes(
+                        (report.total_bytes as f64 / report.elapsed.as_secs_f64().max(1e-3)) as u64
+                    )
+                ),
+                "verify complete",
+            );
+
+            let bad: Vec<ChunkHash> = report
+                .mismatched
+                .iter()
+                .copied()
+                .chain(report.errored.iter().map(|(s, _)| *s))
+                .collect();
+            if bad.is_empty() {
+                return Ok(());
+            }
+            tracing::warn!(
+                bad = bad.len(),
+                attempt = attempt + 1,
+                "deleting bad chunks and refetching",
+            );
+            for sha in &bad {
+                let path = store.chunks_root().join(sha.to_string());
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(%sha, %e, "failed to remove bad chunk");
+                }
+            }
         }
-        Ok::<_, anyhow::Error>(())
+        anyhow::bail!(
+            "cache still has bad chunks after {MAX_REFETCH_ATTEMPTS} verify/refetch passes",
+        );
     })
 }
 

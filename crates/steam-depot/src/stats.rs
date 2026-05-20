@@ -14,7 +14,7 @@ use steam_depot_vfs::{ChunkHash, DepotStore, SteamAuth};
 use crate::auth::Auth;
 use crate::config::Config;
 
-pub fn run(cfg: &Config) -> Result<()> {
+pub fn run(cfg: &Config, verify: bool) -> Result<()> {
     let store = DepotStore::new(cfg.store_root.clone());
 
     // First pass: see which configured manifests are missing on disk
@@ -196,7 +196,103 @@ pub fn run(cfg: &Config) -> Result<()> {
         all_chunks.len(),
         chunk_pct,
     );
+
+    if verify {
+        verify_cache(&store, &cache)?;
+    }
     Ok(())
+}
+
+/// Read every chunk file in the cache and confirm its SHA-1 matches
+/// its filename. Catches bit-rot and partial writes. Parallelised via
+/// `std::thread::scope` so we saturate the disk + CPU without depending
+/// on the rest of the program's Tokio runtime.
+fn verify_cache(store: &DepotStore, cache: &CacheScan) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    println!();
+    println!(
+        "verifying {} cached chunks ({})...",
+        cache.shas.len(),
+        human_bytes(cache.bytes)
+    );
+    let started = std::time::Instant::now();
+    let root = store.chunks_root();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // mpsc job queue: each job is a `(expected_sha, file_path)` pair.
+    let (tx, rx) = mpsc::channel::<(ChunkHash, std::path::PathBuf)>();
+    let rx = std::sync::Mutex::new(rx);
+
+    let ok = AtomicU64::new(0);
+    let mismatched = std::sync::Mutex::new(Vec::<ChunkHash>::new());
+    let errored = std::sync::Mutex::new(Vec::<(ChunkHash, String)>::new());
+
+    std::thread::scope(|s| {
+        // Worker pool.
+        for _ in 0..workers {
+            let rx = &rx;
+            let ok = &ok;
+            let mismatched = &mismatched;
+            let errored = &errored;
+            s.spawn(move || {
+                loop {
+                    let job = rx.lock().unwrap().recv();
+                    let Ok((expected, path)) = job else {
+                        return;
+                    };
+                    match verify_one(&expected, &path) {
+                        Ok(true) => {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(false) => {
+                            mismatched.lock().unwrap().push(expected);
+                        }
+                        Err(e) => {
+                            errored.lock().unwrap().push((expected, e.to_string()));
+                        }
+                    }
+                }
+            });
+        }
+        // Feed jobs.
+        for sha in &cache.shas {
+            tx.send((*sha, root.join(sha.to_string()))).unwrap();
+        }
+        drop(tx);
+    });
+
+    let elapsed = started.elapsed();
+    let ok = ok.load(Ordering::Relaxed);
+    let mismatched = mismatched.into_inner().unwrap();
+    let errored = errored.into_inner().unwrap();
+    let throughput = cache.bytes as f64 / elapsed.as_secs_f64().max(1e-3);
+    println!(
+        "verified {ok} ok, {} mismatched, {} errored in {:.1}s ({}/s)",
+        mismatched.len(),
+        errored.len(),
+        elapsed.as_secs_f64(),
+        human_bytes(throughput as u64),
+    );
+    for sha in &mismatched {
+        println!("  mismatch: {sha}");
+    }
+    for (sha, err) in &errored {
+        println!("  error {sha}: {err}");
+    }
+    Ok(())
+}
+
+fn verify_one(expected: &ChunkHash, path: &std::path::Path) -> Result<bool> {
+    use sha1::{Digest, Sha1};
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes);
+    let got = hasher.finalize();
+    Ok(got.as_slice() == expected.0.as_slice())
 }
 
 struct CacheScan {

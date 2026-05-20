@@ -7,6 +7,7 @@ mod config;
 mod prefetch;
 mod prune;
 mod stats;
+mod verify;
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -70,8 +71,16 @@ enum Cmd {
         seconds: Option<u64>,
     },
     /// Print local-cache stats: which manifests are how completely
-    /// downloaded, total bytes on disk, etc. No network access.
-    Stats,
+    /// downloaded, total bytes on disk, etc. Network access only for
+    /// fetching manifests that aren't yet on disk.
+    Stats {
+        /// SHA-1 every cached chunk and check it matches its filename.
+        /// Catches on-disk bit-rot or any other reason a chunk might
+        /// have become inconsistent since it was written. Takes
+        /// seconds-to-minutes depending on cache size.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Delete every cached chunk. Manifests on disk are kept (they're
     /// tiny and offline-replayable). No network access.
     Prune {
@@ -94,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         // `stats` is mostly silent (its output is the table it prints
         // on stdout), but we want to see the one-line manifest-fetch
         // note on the rare runs where it goes online.
-        Cmd::Stats => "warn,steam_depot::stats=info",
+        Cmd::Stats { .. } => "warn,steam_depot::stats=info",
         Cmd::Prune { .. } => "warn",
     };
     // Display filter is per-fmt-layer so we can keep the user-facing
@@ -104,7 +113,7 @@ fn main() -> anyhow::Result<()> {
 
     let timings_path = match &cli.cmd {
         Cmd::Mount { timings } | Cmd::Prefetch { timings, .. } => timings.clone(),
-        Cmd::Stats | Cmd::Prune { .. } => None,
+        Cmd::Stats { .. } | Cmd::Prune { .. } => None,
     };
     let perfetto = timings_path
         .as_deref()
@@ -142,7 +151,7 @@ fn main() -> anyhow::Result<()> {
             seconds,
             ..
         } => prefetch::run(cfg, parallelism, seconds),
-        Cmd::Stats => stats::run(&cfg),
+        Cmd::Stats { verify } => stats::run(&cfg, verify),
         Cmd::Prune { yes } => prune::run(&cfg, yes),
     }
 }
