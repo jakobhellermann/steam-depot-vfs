@@ -38,7 +38,7 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
 }
 
 impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
-    #[tracing::instrument(name = "fs_cache.get", skip(self), fields(%sha))]
+    #[tracing::instrument(name = "fs_cache.get", skip_all)]
     async fn get(&self, sha: ChunkHash) -> Result<Bytes> {
         let path = self.path_for(sha);
         if let Ok(bytes) = tokio::fs::read(&path).await {
@@ -49,7 +49,7 @@ impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
         Ok(bytes)
     }
 
-    #[tracing::instrument(name = "fs_cache.ensure", skip(self), fields(%sha))]
+    #[tracing::instrument(name = "fs_cache.ensure", skip_all)]
     async fn ensure(&self, sha: ChunkHash) -> Result<()> {
         let path = self.path_for(sha);
         // `try_exists` is the cheap check: a single `stat` rather than
