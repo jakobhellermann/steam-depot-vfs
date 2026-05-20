@@ -6,11 +6,11 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fuser::experimental::TokioAdapter;
 use fuser::{BackgroundSession, MountOption};
 use parking_lot::RwLock;
 use steam_depot_vfs::chunk_store::ChunkStore;
 use steam_depot_vfs::fs::DepotSnapshot;
+use tokio::runtime::Handle;
 
 use crate::fuse::FuseFs;
 use crate::tree::{AddError, MountTree, SnapshotId};
@@ -44,10 +44,15 @@ impl<C: ChunkStore + 'static> Mount<C> {
     /// becomes visible immediately but contains no manifests until you
     /// call [`Mount::add`].
     ///
+    /// `rt` is the Tokio runtime handle the FUSE adapter spawns async
+    /// chunk fetches on. Pass the caller's main runtime so we don't
+    /// build a second one — keep the runtime alive at least as long as
+    /// the returned [`Mount`].
+    ///
     /// The mountpoint directory must already exist.
-    pub fn start(cfg: MountConfig) -> Result<Self, MountError> {
+    pub fn start(cfg: MountConfig, rt: Handle) -> Result<Self, MountError> {
         let tree = Arc::new(RwLock::new(MountTree::<C>::new()));
-        let fs = FuseFs::new(Arc::clone(&tree));
+        let fs = FuseFs::new(Arc::clone(&tree), rt);
         let mut fuser_cfg = fuser::Config::default();
         fuser_cfg.mount_options = vec![
             MountOption::RO,
@@ -56,8 +61,8 @@ impl<C: ChunkStore + 'static> Mount<C> {
                     .unwrap_or_else(|| "steam-depot-mount".to_string()),
             ),
         ];
-        let session = fuser::Session::new(TokioAdapter::new(fs), &cfg.mountpoint, &fuser_cfg)
-            .map_err(MountError::Fuse)?;
+        let session =
+            fuser::Session::new(fs, &cfg.mountpoint, &fuser_cfg).map_err(MountError::Fuse)?;
         let bg = session.spawn().map_err(MountError::Fuse)?;
         Ok(Self { bg, tree })
     }

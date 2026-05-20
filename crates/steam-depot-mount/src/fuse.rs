@@ -1,153 +1,199 @@
 // TODO(ai-review): review for correctness/style
-//! `AsyncFilesystem` impl on top of [`MountTree`]. Translates between
-//! fuser's inode/handle world and the tree's snapshot+index world.
+//! `Filesystem` impl on top of [`MountTree`]. Bridges fuser's blocking
+//! callbacks to async operations on a Tokio runtime supplied by the
+//! caller. We hold a `Handle`, not a `Runtime`, so the FUSE adapter
+//! shares the binary's main runtime instead of building its own.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use fuser::experimental::{
-    AsyncFilesystem, DirEntListBuilder, GetAttrResponse, LookupResponse, RequestContext,
-};
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Generation, INodeNo, LockOwner, OpenFlags, experimental,
+    Errno, FileAttr, FileType, Filesystem, Generation, INodeNo, OpenFlags, ReplyAttr, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, Request,
 };
 use parking_lot::RwLock;
 use steam_depot_vfs::FileKind;
 use steam_depot_vfs::chunk_store::ChunkStore;
 use steam_depot_vfs::fs::Entry;
+use tokio::runtime::Handle;
+use tracing::Instrument as _;
 
 use crate::inode::{self, SYNTHETIC};
 use crate::tree::{MountTree, SnapshotEntry};
 
-/// FUSE attribute TTL. The tree is mutable (snapshots come and go), but
-/// individual snapshots are immutable for their lifetime. One hour
-/// matches user expectations for "static-ish" content; on snapshot
-/// remove we'd need [`fuser::Notifier::inval_entry`] to invalidate
-/// eagerly. v1 doesn't bother — the next `lookup` will see `ENOENT`.
+/// FUSE attribute TTL. Snapshots are immutable for their lifetime; on
+/// snapshot remove the kernel will see ENOENT only after this expires.
+/// One hour matches user expectations for "static-ish" content.
 const TTL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct FuseFs<C: ChunkStore + 'static> {
     tree: Arc<RwLock<MountTree<C>>>,
+    rt: Handle,
 }
 
 impl<C: ChunkStore + 'static> FuseFs<C> {
-    pub fn new(tree: Arc<RwLock<MountTree<C>>>) -> Self {
-        Self { tree }
+    pub fn new(tree: Arc<RwLock<MountTree<C>>>, rt: Handle) -> Self {
+        Self { tree, rt }
     }
 }
 
-#[async_trait::async_trait]
-impl<C: ChunkStore + 'static> AsyncFilesystem for FuseFs<C> {
-    async fn lookup(
-        &self,
-        _ctx: &RequestContext,
-        parent: INodeNo,
-        name: &OsStr,
-    ) -> experimental::Result<LookupResponse> {
+impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let _span = tracing::info_span!("fuse.lookup").entered();
-        let name = name.to_str().ok_or(Errno::ENOENT)?;
         let tree = self.tree.read();
-        let (_ino, attr) = resolve_child(&tree, parent, name).ok_or(Errno::ENOENT)?;
-        Ok(LookupResponse::new(TTL, attr, Generation(0)))
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match resolve_child(&tree, parent, name) {
+            Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
+            None => reply.error(Errno::ENOENT),
+        }
     }
 
-    async fn getattr(
+    fn getattr(
         &self,
-        _ctx: &RequestContext,
+        _req: &Request,
         ino: INodeNo,
-        _fh: Option<FileHandle>,
-    ) -> experimental::Result<GetAttrResponse> {
+        _fh: Option<fuser::FileHandle>,
+        reply: ReplyAttr,
+    ) {
         let _span = tracing::info_span!("fuse.getattr").entered();
         let tree = self.tree.read();
-        let attr = attr_for(&tree, ino).ok_or(Errno::ENOENT)?;
-        Ok(GetAttrResponse::new(TTL, attr))
+        match attr_for(&tree, ino) {
+            Some(attr) => reply.attr(&TTL, &attr),
+            None => reply.error(Errno::ENOENT),
+        }
     }
 
-    async fn readdir(
+    fn readdir(
         &self,
-        _ctx: &RequestContext,
+        _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        _fh: fuser::FileHandle,
         offset: u64,
-        mut builder: DirEntListBuilder<'_>,
-    ) -> experimental::Result<()> {
+        mut reply: ReplyDirectory,
+    ) {
         let _span = tracing::info_span!("fuse.readdir").entered();
-        // Snapshot the entries to release the lock before calling into
-        // `builder.add` (which is sync but we don't want to hold the
-        // RwLock across the whole iteration regardless).
         let entries = {
             let tree = self.tree.read();
-            collect_dir(&tree, ino).ok_or(Errno::ENOENT)?
+            match collect_dir(&tree, ino) {
+                Some(e) => e,
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
         };
 
+        // Cookie semantics match the experimental API: each `reply.add`
+        // is given `offset+1`; the kernel echoes it back on the next
+        // call so we can resume.
         let mut cookie = 0u64;
-        let mut add = |child_ino, kind, name: &str| -> bool {
+        if cookie >= offset || !reply.add(ino, cookie + 1, FileType::Directory, ".") {
             cookie += 1;
-            cookie <= offset || builder.add(child_ino, cookie, kind, name)
-        };
-        if add(ino, FileType::Directory, ".") {
-            return Ok(());
+        } else {
+            reply.ok();
+            return;
         }
-        if add(ino, FileType::Directory, "..") {
-            return Ok(());
+        if cookie >= offset || !reply.add(ino, cookie + 1, FileType::Directory, "..") {
+            cookie += 1;
+        } else {
+            reply.ok();
+            return;
         }
         for (child_ino, kind, name) in entries {
-            if add(child_ino, kind, &name) {
+            cookie += 1;
+            if cookie <= offset {
+                continue;
+            }
+            if reply.add(child_ino, cookie, kind, &name) {
                 break;
             }
         }
-        Ok(())
+        reply.ok();
     }
 
-    #[tracing::instrument(name = "fuse.read", skip_all)]
-    async fn read(
+    fn read(
         &self,
-        _ctx: &RequestContext,
+        _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        _fh: fuser::FileHandle,
         offset: u64,
         size: u32,
         _flags: OpenFlags,
-        _lock: Option<LockOwner>,
-        out_data: &mut Vec<u8>,
-    ) -> experimental::Result<()> {
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyData,
+    ) {
         let (sid, idx) = inode::unpack(ino);
         if sid == SYNTHETIC {
-            return Err(Errno::EISDIR);
+            reply.error(Errno::EISDIR);
+            return;
         }
-        let file_idx = (idx as usize).checked_sub(1).ok_or(Errno::EISDIR)?;
-        // Clone the Arc out from under the read lock so the CDN fetch
-        // can run without blocking concurrent `add`/`remove`.
+        let Some(file_idx) = (idx as usize).checked_sub(1) else {
+            reply.error(Errno::EISDIR);
+            return;
+        };
+        // Clone the snapshot Arc out of the tree before going async so
+        // the CDN fetch doesn't block concurrent `add`/`remove`.
         let entry = {
             let tree = self.tree.read();
-            tree.snapshot(sid).ok_or(Errno::ENOENT)?.clone()
-        };
-        let path = {
-            let file = entry
-                .snapshot
-                .manifest()
-                .files
-                .get(file_idx)
-                .ok_or(Errno::ENOENT)?;
-            if matches!(file.kind, FileKind::Symlink) {
-                tracing::warn!(
-                    path = %file.path,
-                    target = ?file.linktarget,
-                    "reading symlink as regular file; link target not resolved",
-                );
+            match tree.snapshot(sid) {
+                Some(e) => e.clone(),
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
             }
-            file.path.clone()
         };
-        entry
-            .snapshot
-            .read_into(&path, offset, size as u64, out_data)
-            .await
-            .map_err(|e| {
-                tracing::warn!(path = %path, offset, size, %e, "read failed");
-                Errno::EIO
-            })?;
-        Ok(())
+        let path = match entry.snapshot.manifest().files.get(file_idx) {
+            Some(file) => {
+                if matches!(file.kind, FileKind::Symlink) {
+                    tracing::warn!(
+                        path = %file.path,
+                        target = ?file.linktarget,
+                        "reading symlink as regular file; link target not resolved",
+                    );
+                }
+                file.path.clone()
+            }
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+        // Drop into our shared runtime to run the async fetch + cache
+        // read. fuser's main loop is blocking, but each callback is
+        // allowed to return without sending a reply as long as
+        // *something* eventually does — so we hand the reply to the
+        // task and let it complete out-of-band.
+        let span = tracing::info_span!("fuse.read");
+        self.rt.spawn(
+            async move {
+                let mut buf = Vec::with_capacity(size as usize);
+                match entry
+                    .snapshot
+                    .read_into(&path, offset, size as u64, &mut buf)
+                    .await
+                {
+                    Ok(()) => reply.data(&buf),
+                    Err(e) => {
+                        tracing::warn!(path = %path, offset, size, %e, "read failed");
+                        reply.error(Errno::EIO);
+                    }
+                }
+            }
+            .instrument(span),
+        );
+    }
+
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        // Read-only mount, all paths are world-readable; rather than
+        // letting fuser's default fall through to ENOSYS (which clutters
+        // logs), say "yes" to every check. The kernel does its own
+        // perm check against the `perm` we report in getattr anyway.
+        reply.ok();
     }
 }
 
@@ -181,13 +227,10 @@ fn resolve_child<C: ChunkStore>(
 fn attr_for<C: ChunkStore>(tree: &MountTree<C>, ino: INodeNo) -> Option<FileAttr> {
     let (sid, idx) = inode::unpack(ino);
     if sid == SYNTHETIC {
-        // Synthetic dirs report size 0; the children count would be
-        // more accurate but `du`/`ls` work fine with 0.
         return Some(dir_attr(ino, 0));
     }
     let entry = tree.snapshot(sid)?;
     if idx == 0 {
-        // Snapshot root: a directory.
         return Some(dir_attr(ino, 0));
     }
     let f = entry.snapshot.manifest().files.get(idx as usize - 1)?;
@@ -253,10 +296,6 @@ fn collect_dir<C: ChunkStore>(
 }
 
 fn dir_attr(ino: INodeNo, size: u64) -> FileAttr {
-    // nlink for directories conventionally counts `.`, `..`, and each
-    // subdirectory. We always report 2 — accurate for leaf dirs, lazy
-    // for non-leaves but standard practice (FUSE filesystems frequently
-    // do this; `find` is the main thing that cares).
     base_attr(ino, size, FileType::Directory, 0o555, 2)
 }
 

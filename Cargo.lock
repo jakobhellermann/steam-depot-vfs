@@ -150,17 +150,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "atomic-polyfill"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -779,7 +768,6 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80a5eca878900c2e39e9e52fd797954b7fc39eeefc8558257114bfea6a698fcf"
 dependencies = [
- "async-trait",
  "bitflags",
  "libc",
  "log",
@@ -791,7 +779,6 @@ dependencies = [
  "pkg-config",
  "ref-cast",
  "smallvec",
- "tokio",
  "zerocopy",
 ]
 
@@ -2566,7 +2553,6 @@ dependencies = [
 name = "steam-depot-mount"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
  "fuser",
  "libc",

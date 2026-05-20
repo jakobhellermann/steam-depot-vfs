@@ -170,16 +170,19 @@ fn mount(cfg: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.mountpoint)?;
     std::fs::create_dir_all(&cfg.store_root)?;
 
-    // `Mount::start` constructs fuser's internal Tokio runtime via
-    // `TokioAdapter`. That runtime must not be created (and especially
-    // not dropped on error) from inside another active runtime — so we
-    // build the mount synchronously here, *before* entering `block_on`.
-    let mount = Mount::start(MountConfig::new(cfg.mountpoint.clone()))?;
-    tracing::info!(mountpoint = %cfg.mountpoint.display(), "mounted");
-
+    // One runtime for everything: the binary's async work AND fuser's
+    // FUSE callbacks both spawn onto this. We build it up front, hand
+    // a `Handle` to `Mount::start`, and keep the runtime alive at least
+    // as long as the mount.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let mount = Mount::start(
+        MountConfig::new(cfg.mountpoint.clone()),
+        rt.handle().clone(),
+    )?;
+    tracing::info!(mountpoint = %cfg.mountpoint.display(), "mounted");
+
     rt.block_on(async {
         let auth = Auth::prepare(cfg.steam.account.clone(), cfg.steam.password.clone()).await?;
         let store = DepotStore::new(cfg.store_root.clone());
