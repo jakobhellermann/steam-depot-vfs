@@ -11,6 +11,9 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 directories.workspace = true
+futures = "0.3.31"
+indicatif = "0.18.0"
+tracing-indicatif = "0.3.13"
 serde.workspace = true
 serde_json.workspace = true
 steam-depot-mount = { path = "../steam-depot-mount" }

@@ -40,7 +40,31 @@ impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
             tracing::debug!(%sha, bytes = bytes.len(), "cache hit");
             return Ok(Bytes::from(bytes));
         }
+        let bytes = self.fetch_and_persist(sha, &path).await?;
+        Ok(bytes)
+    }
 
+    #[tracing::instrument(name = "fs_cache.ensure", skip(self), fields(%sha))]
+    async fn ensure(&self, sha: ChunkHash) -> Result<()> {
+        let path = self.path_for(sha);
+        // `try_exists` is the cheap check: a single `stat` rather than
+        // a full file read. If we can't determine existence (permission
+        // issue, etc.) fall through to the fetch path; it will fail if
+        // truly broken.
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            tracing::debug!(%sha, "cache hit (ensure)");
+            return Ok(());
+        }
+        self.fetch_and_persist(sha, &path).await?;
+        Ok(())
+    }
+}
+
+impl<Inner: ChunkStore> FsCacheStore<Inner> {
+    /// Shared fetch-and-persist path used by both [`get`] and [`ensure`].
+    /// Returns the fetched bytes; callers that don't need them (i.e.
+    /// `ensure`) just discard.
+    async fn fetch_and_persist(&self, sha: ChunkHash, path: &std::path::Path) -> Result<Bytes> {
         tracing::info!(%sha, "cache miss, fetching from inner store");
         let bytes = self.inner.get(sha).await?;
 
@@ -53,7 +77,7 @@ impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
         let mut f = tokio::fs::File::create(&tmp).await?;
         f.write_all(&bytes).await?;
         f.sync_all().await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        tokio::fs::rename(&tmp, path).await?;
         Ok(bytes)
     }
 }

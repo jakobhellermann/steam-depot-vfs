@@ -28,4 +28,18 @@ pub use cdn::CdnChunkStore;
 /// plaintext content of the chunk.
 pub trait ChunkStore: Send + Sync {
     fn get(&self, sha: ChunkHash) -> impl Future<Output = Result<Bytes>> + Send;
+
+    /// Make sure `sha` is present in the store, but don't return the
+    /// bytes. Useful for prefetch loops that want to populate a cache
+    /// without paying to read every chunk back through memory.
+    ///
+    /// Default impl falls back to [`get`](Self::get) and discards the
+    /// bytes. [`cache::FsCacheStore`] overrides this to short-circuit
+    /// when the chunk already exists on disk.
+    fn ensure(&self, sha: ChunkHash) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            self.get(sha).await?;
+            Ok(())
+        }
+    }
 }

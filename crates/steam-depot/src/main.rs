@@ -4,6 +4,7 @@
 
 mod auth;
 mod config;
+mod prefetch;
 mod stats;
 
 use std::fs::File;
@@ -13,6 +14,7 @@ use std::sync::Mutex;
 use clap::{Parser, Subcommand};
 use steam_depot_mount::{Mount, MountConfig};
 use steam_depot_vfs::DepotStore;
+use tracing_indicatif::IndicatifLayer;
 use tracing_perfetto::PerfettoLayer;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
@@ -44,18 +46,33 @@ enum Cmd {
         )]
         timings: Option<PathBuf>,
     },
+    /// Download every chunk of every configured manifest into the local
+    /// cache. Skips anything already on disk. Exits when done.
+    Prefetch {
+        /// Same semantics as `mount --timings`.
+        #[arg(
+            long,
+            value_name = "FILE",
+            num_args = 0..=1,
+            default_missing_value = "trace.pftrace",
+        )]
+        timings: Option<PathBuf>,
+    },
     /// Print local-cache stats: which manifests are how completely
     /// downloaded, total bytes on disk, etc. No network access.
     Stats,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // One-shot reporting subcommands stay quiet by default; the daemon
     // ones log at info.
     let default_filter = match cli.cmd {
         Cmd::Mount { .. } => "info,steam_depot_vfs=debug,fuser=error",
+        // Per-chunk INFO is still noisy here, even with indicatif
+        // keeping the bar intact. Warn-only for chunk_store keeps the
+        // output focused on progress and real failures.
+        Cmd::Prefetch { .. } => "info,steam_depot_vfs::chunk_store=warn,fuser=error",
         Cmd::Stats => "warn",
     };
     // Display filter is per-fmt-layer so we can keep the user-facing
@@ -64,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
 
     let timings_path = match &cli.cmd {
-        Cmd::Mount { timings } => timings.clone(),
+        Cmd::Mount { timings } | Cmd::Prefetch { timings } => timings.clone(),
         Cmd::Stats => None,
     };
     let perfetto = timings_path
@@ -75,9 +92,19 @@ async fn main() -> anyhow::Result<()> {
         })
         .transpose()?;
 
+    // Route the fmt layer's writer through indicatif so any active
+    // ProgressBars (currently only the prefetch one) aren't clobbered
+    // by tracing output during the prefetch loop. We turn off the
+    // default span-as-bar behavior so transient framework spans (like
+    // websocket connects in steam-vent) don't flash a bar.
+    let indicatif_layer = IndicatifLayer::new().with_max_progress_bars(0, None);
     tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(indicatif_layer.get_stderr_writer())
+                .with_filter(display_filter),
+        )
+        .with(indicatif_layer)
         .with(perfetto)
         .init();
 
@@ -87,35 +114,46 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_file(&cli.config)?;
     match cli.cmd {
-        Cmd::Mount { .. } => mount(cfg).await,
+        Cmd::Mount { .. } => mount(cfg),
+        Cmd::Prefetch { .. } => prefetch::run(cfg),
         Cmd::Stats => stats::run(&cfg),
     }
 }
 
-async fn mount(cfg: Config) -> anyhow::Result<()> {
+fn mount(cfg: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.mountpoint)?;
     std::fs::create_dir_all(&cfg.store_root)?;
 
-    let auth = Auth::prepare(cfg.steam.account.clone(), cfg.steam.password.clone()).await?;
-    let store = DepotStore::new(cfg.store_root.clone());
-
+    // `Mount::start` constructs fuser's internal Tokio runtime via
+    // `TokioAdapter`. That runtime must not be created (and especially
+    // not dropped on error) from inside another active runtime — so we
+    // build the mount synchronously here, *before* entering `block_on`.
     let mount = Mount::start(MountConfig::new(cfg.mountpoint.clone()))?;
     tracing::info!(mountpoint = %cfg.mountpoint.display(), "mounted");
 
-    for m in &cfg.manifests {
-        tracing::info!(
-            app_id = m.app_id,
-            depot_id = m.depot_id,
-            gid = m.gid,
-            branch = m.branch,
-            "opening manifest",
-        );
-        let snapshot = store
-            .open_depot_manifest(auth.clone(), m.app_id, m.depot_id, m.gid, &m.branch)
-            .await?;
-        mount.add(m.app_id, m.depot_id, m.gid, snapshot)?;
-    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let auth = Auth::prepare(cfg.steam.account.clone(), cfg.steam.password.clone()).await?;
+        let store = DepotStore::new(cfg.store_root.clone());
 
-    mount.wait_for_signal().await?;
+        for m in &cfg.manifests {
+            tracing::info!(
+                app_id = m.app_id,
+                depot_id = m.depot_id,
+                gid = m.gid,
+                branch = m.branch,
+                "opening manifest",
+            );
+            let snapshot = store
+                .open_depot_manifest(auth.clone(), m.app_id, m.depot_id, m.gid, &m.branch)
+                .await?;
+            mount.add(m.app_id, m.depot_id, m.gid, snapshot)?;
+        }
+
+        mount.wait_for_signal().await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
     Ok(())
 }

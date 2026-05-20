@@ -67,6 +67,12 @@ impl<C: ChunkStore> DepotSnapshot<C> {
         &self.manifest
     }
 
+    /// Underlying chunk store. Mostly useful for tools that want to
+    /// drive a custom warmup loop over `manifest().files[].chunks[]`.
+    pub fn chunks(&self) -> &C {
+        &self.chunks
+    }
+
     /// Index into [`Manifest::files`] for `path`, if present. The empty path
     /// and `"/"` are *not* valid here — they refer to the synthetic root, which
     /// has no entry in `manifest.files`.
