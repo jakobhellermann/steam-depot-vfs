@@ -11,10 +11,11 @@
 //!
 //! # Auth
 //!
-//! Steam access goes through the [`DepotAuth`] trait, which yields an
-//! [`AuthSession`] (client + depot key + CDN servers) on demand. Implement
-//! it for whatever lazy/eager login flow you want — the lib stays out of the
-//! login policy.
+//! Steam access goes through the [`SteamAuth`] trait, which yields a
+//! [`SteamSession`] (client + CDN servers) on demand. Depot keys are
+//! fetched by [`DepotStore`] itself and cached in-process — auth impls
+//! don't need to know about them. Implement [`SteamAuth`] for whatever
+//! lazy/eager login flow you want; the lib stays out of login policy.
 //!
 //! # Chunk plumbing
 //!
@@ -36,7 +37,7 @@ mod error;
 pub mod fs;
 mod manifest_cache;
 
-pub use auth::{AuthSession, DepotAuth};
+pub use auth::{SteamAuth, SteamSession};
 pub use context::DepotStore;
 pub use error::{Result, VfsError};
 pub use manifest_cache::CacheError;

@@ -1,0 +1,18 @@
+[package]
+name = "steam-depot-mount"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+bytes.workspace = true
+parking_lot = "0.12.5"
+steam-depot-vfs = { path = "../steam-depot-vfs" }
+steam-vent-depot.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "signal"] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.17.0", features = ["experimental"] }
+libc = "0.2.186"

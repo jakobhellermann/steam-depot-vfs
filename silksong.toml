@@ -1,0 +1,43 @@
+# mountpoint = "/tmp/steam"
+# store_root = "/tmp/steam-vfs-store"
+
+mountpoint = "/home/jakob/dev/rust/contrib/steam/steam-depot-vfs/target/steam"
+store_root = "/home/jakob/dev/rust/contrib/steam/steam-depot-vfs/target/steam-vfs-store"
+
+[steam]
+account = "jjakobh"
+password = ""
+
+[[depot]]
+app_id = 1030300
+depot_id = 1030303
+manifests = [
+  "7921642076658611197",
+  "7780372375671997910",
+  "3678462974375346661:public-beta",
+  "6891565886978421564",
+  "2218100490558811317",
+  "5214620417486766611:public-beta",
+  "6749555578797255119:public-beta",
+  "8319328134112215412:public-beta",
+  "4349246050376532986",
+  "418064208006580388:public-beta",
+  "953032810487360641:public-beta",
+  "8078874762924599313",
+  "4164613462984196672:public-beta",
+  "2398468183864037547:public-beta",
+  "5854885955371247010:public-beta",
+  "7267278887283058624:public-beta",
+  "5160579549450741182:public-beta",
+  "5954103139200615141",
+  "319601307747535307:public-beta",
+  "2306980963761202438:public-beta",
+  "1617544312110692774",
+  "7495630131038458486",
+  "2356039248449654760:public-beta",
+  "6373658714389144408",
+  "6701825740120558137",
+  "5917697910613228100:public-beta",
+  "6624944077294342953:public-beta",
+  "8384590172287463475",
+]

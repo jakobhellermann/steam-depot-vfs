@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use steam_depot_vfs::{
-    AuthSession, DepotAuth, DepotStore, FileKind, VfsError, chunk_store::ChunkStore,
+    DepotStore, FileKind, SteamAuth, SteamSession, VfsError, chunk_store::ChunkStore,
     fs::DepotSnapshot,
 };
 use steam_vent::Connection;
@@ -59,11 +59,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let store_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("vfs-store");
+    let store_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/vfs-store");
 
-    let auth = Auth::prepare(cli.account, cli.password, cli.app_id, cli.depot_id).await?;
+    let auth = Auth::prepare(cli.account, cli.password).await?;
     let vfs = DepotStore::new(store_root);
     let fs = vfs
         .open_depot_manifest(
@@ -122,25 +120,18 @@ async fn cat(fs: &DepotSnapshot<impl ChunkStore>, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Authenticated session that defers `login + depot_key + cdn_servers` until
+/// Authenticated session that defers `login + cdn_servers` until
 /// something actually needs them.
 struct Auth {
     account: String,
     password: String,
-    app_id: u32,
-    depot_id: u32,
-    inner: OnceCell<AuthSession>,
+    inner: OnceCell<SteamSession>,
 }
 
 impl Auth {
     /// Defers login if a refresh token is cached (silent), otherwise logs in
     /// eagerly so any Steam-Guard prompt happens up front instead of mid-run.
-    async fn prepare(
-        account: String,
-        password: String,
-        app_id: u32,
-        depot_id: u32,
-    ) -> Result<Arc<Self>> {
+    async fn prepare(account: String, password: String) -> Result<Arc<Self>> {
         let inner = if login::has_refresh_token(&account) {
             tracing::info!(account, "refresh token cached, auth will run lazily");
             OnceCell::new()
@@ -149,26 +140,22 @@ impl Auth {
                 account,
                 "no refresh token cached, logging in eagerly (may prompt for steam guard)"
             );
-            let ctx = authenticate(&account, &password, app_id, depot_id).await?;
+            let ctx = authenticate(&account, &password).await?;
             OnceCell::new_with(Some(ctx))
         };
         Ok(Arc::new(Self {
             account,
             password,
-            app_id,
-            depot_id,
             inner,
         }))
     }
 }
 
-impl DepotAuth for Auth {
-    fn resolve(&self) -> impl Future<Output = Result<AuthSession, VfsError>> + Send {
+impl SteamAuth for Auth {
+    fn resolve(&self) -> impl Future<Output = Result<SteamSession, VfsError>> + Send {
         async move {
             self.inner
-                .get_or_try_init(|| {
-                    authenticate(&self.account, &self.password, self.app_id, self.depot_id)
-                })
+                .get_or_try_init(|| authenticate(&self.account, &self.password))
                 .await
                 .cloned()
                 .map_err(|e: anyhow::Error| VfsError::Other(e.to_string().into()))
@@ -176,23 +163,15 @@ impl DepotAuth for Auth {
     }
 }
 
-async fn authenticate(
-    account: &str,
-    password: &str,
-    app_id: u32,
-    depot_id: u32,
-) -> Result<AuthSession> {
+async fn authenticate(account: &str, password: &str) -> Result<SteamSession> {
     tracing::info!("establishing connection");
     let connection: Connection = login::establish_connection(account, password).await?;
     let client = Arc::new(DepotClient::new(connection));
-    tracing::info!(app_id, depot_id, "fetching depot key");
-    let depot_key = client.depot_key(app_id, depot_id).await?;
     tracing::info!("discovering cdn servers");
     let cdn_servers: Arc<[CdnServer]> = client.cdn_servers().await?.into();
     tracing::info!(count = cdn_servers.len(), "got cdn servers");
-    Ok(AuthSession {
+    Ok(SteamSession {
         client,
-        depot_key,
         cdn_servers,
     })
 }

@@ -1,27 +1,22 @@
-[package]
-name = "steam-depot-vfs"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 edition = "2024"
+version = "0.1.0"
 
-[dependencies]
-bytes = "1.11.1"
-postcard = { version = "1.1.3", features = ["alloc"] }
-serde = { version = "1.0.228", features = ["derive"] }
-steam-vent-depot = { version = "0.1.0", path = "../steam-vent-depot" }
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["fs", "io-util", "sync"] }
-tracing = "0.1.44"
-
-[dev-dependencies]
+[workspace.dependencies]
 anyhow = "1.0.102"
+bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 steam-vent = "0.5.0"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "fs", "io-util", "signal"] }
+steam-vent-depot = { version = "0.1.0", path = "../steam-vent-depot" }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", default-features = false }
+toml = "0.9.8"
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-async-trait = "0.1.89"
-fuser = { version = "0.17.0", features = ["experimental"] }
-libc = "0.2.186"
