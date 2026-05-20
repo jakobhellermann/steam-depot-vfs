@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Inode encoding (option A): pack a 16-bit snapshot id into the high bits
 //! of a 64-bit inode, leaving 48 bits for a within-snapshot index.
 //!

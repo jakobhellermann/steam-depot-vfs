@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Steam CDN-backed chunk store.
 
 use std::collections::HashMap;

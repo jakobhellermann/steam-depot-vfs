@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! `stats` subcommand: walk the local chunk cache and report per-manifest
 //! download progress. Purely offline — no Steam roundtrips.
 

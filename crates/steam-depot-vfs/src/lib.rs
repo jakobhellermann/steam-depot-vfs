@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Programmatic, file-system-shaped access to a Steam depot manifest, with
 //! transparent local caching of manifests and chunks.
 //!

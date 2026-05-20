@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! `steam-depot` — mount one or more Steam depots as a single FUSE
 //! filesystem. Linux only.
 

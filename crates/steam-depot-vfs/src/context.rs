@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! High-level entry point that wires up auth, manifest cache, and chunk cache.
 
 use std::collections::HashMap;

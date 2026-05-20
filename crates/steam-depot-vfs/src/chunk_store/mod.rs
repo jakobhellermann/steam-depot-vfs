@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Pluggable byte source for chunks, keyed by SHA-1.
 //!
 //! The library ships with two implementations:

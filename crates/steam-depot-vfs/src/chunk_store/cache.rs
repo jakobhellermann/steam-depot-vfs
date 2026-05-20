@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Local-disk write-through cache wrapping any other [`ChunkStore`].
 
 use std::path::PathBuf;

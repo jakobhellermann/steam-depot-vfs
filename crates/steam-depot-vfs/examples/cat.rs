@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Browse a Steam depot manifest like a filesystem.
 
 use std::future::Future;

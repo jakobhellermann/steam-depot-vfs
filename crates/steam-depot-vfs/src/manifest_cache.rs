@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Persistent cache for parsed [`Manifest`]s.
 //!
 //! Manifests are immutable for a given `(depot_id, manifest_id)` — Steam

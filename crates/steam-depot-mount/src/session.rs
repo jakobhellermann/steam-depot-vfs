@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Mount lifecycle: the FUSE session, signal handling, and the public
 //! [`Mount`] handle.
 

@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Filesystem-shaped view over a single depot manifest.
 
 use std::collections::HashMap;

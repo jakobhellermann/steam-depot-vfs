@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Mount one or more Steam depot manifests as a single read-only FUSE
 //! filesystem. The mount exposes a fixed three-level prefix:
 //!

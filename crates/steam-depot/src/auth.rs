@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Lazy auth wrapper that caches a Steam refresh token on disk so the
 //! daemon can resume without re-prompting after a restart.
 

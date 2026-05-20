@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! TOML config for the `steam-depot` binary.
 //!
 //! Example:

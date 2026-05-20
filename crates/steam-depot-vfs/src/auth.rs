@@ -1,3 +1,4 @@
+// TODO(ai-review): review for correctness/style
 //! Pluggable auth source for talking to Steam.
 //!
 //! The lib needs a connected [`DepotClient`] and a list of [`CdnServer`]s
