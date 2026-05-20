@@ -12,15 +12,19 @@
 //!       "Hollow Knight Silksong_Data/StreamingAssets/aa/AddressablesLink/link.xml"
 
 use std::env::args;
+use std::future::Future;
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-
-use std::path::PathBuf;
-
-use steam_depot_vfs::{DepotFs, FileKind, FsCacheStore, ManifestCache, SteamCdnChunkStore};
-use steam_vent_depot::DepotClient;
+use bytes::Bytes;
+use steam_depot_vfs::{
+    ChunkSha, ChunkStore, DepotFs, FileKind, FsCacheStore, ManifestCache, SteamCdnChunkStore,
+};
+use steam_vent::Connection;
+use steam_vent_depot::{CdnServer, DepotClient, DepotKey, Manifest};
+use tokio::sync::OnceCell;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,38 +61,40 @@ async fn main() -> Result<()> {
         .join("vfs-store");
     let manifest_cache = ManifestCache::new(store_root.join("manifests"));
 
-    tracing::info!("establishing connection");
-    let connection = login::establish_connection(&account, &password).await?;
-    let client = Arc::new(DepotClient::new(connection));
+    let auth = Auth::prepare(account, password, app_id, depot_id).await?;
 
-    tracing::info!(app_id, depot_id, "fetching depot key");
-    let depot_key = client.depot_key(app_id, depot_id).await?;
-    tracing::info!("discovering cdn servers");
-    let cdn_servers = client.cdn_servers().await?;
-    tracing::info!(count = cdn_servers.len(), "got cdn servers");
-    let manifest = manifest_cache
-        .get_or_fetch::<_, _, anyhow::Error>(depot_id, manifest_gid, || async {
+    let manifest = match manifest_cache.load(depot_id, manifest_gid)? {
+        Some(m) => m,
+        None => {
+            let ctx = auth.get().await?;
             tracing::info!(depot_id, manifest_gid, branch, "fetching manifest");
-            let code = client
+            let code = ctx
+                .client
                 .manifest_request_code(app_id, depot_id, manifest_gid, &branch)
                 .await?;
-            let m = client
-                .fetch_manifest(&cdn_servers, depot_id, manifest_gid, code, &depot_key)
+            let m = ctx
+                .client
+                .fetch_manifest(
+                    &ctx.cdn_servers,
+                    depot_id,
+                    manifest_gid,
+                    code,
+                    &ctx.depot_key,
+                )
                 .await?;
-            Ok(m)
-        })
-        .await?;
+            manifest_cache.save(&m)?;
+            m
+        }
+    };
 
-    let cdn_store = SteamCdnChunkStore::new(
-        Arc::clone(&client),
-        cdn_servers,
-        depot_id,
-        depot_key,
-        &manifest,
+    let manifest = Arc::new(manifest);
+    let lazy_cdn = CdnStore::new(Arc::clone(&auth), depot_id, Arc::clone(&manifest));
+    let store = FsCacheStore::new(lazy_cdn, store_root.join("chunks"));
+
+    let fs = DepotFs::new(
+        Arc::try_unwrap(manifest).unwrap_or_else(|a| (*a).clone()),
+        store,
     );
-    let store = FsCacheStore::new(cdn_store, store_root.join("chunks"));
-
-    let fs = DepotFs::new(manifest, store);
 
     match cmd.as_str() {
         "ls" => {
@@ -119,6 +125,127 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Authenticated session that defers `login + depot_key + cdn_servers` until
+/// something actually needs them.
+struct Auth {
+    account: String,
+    password: String,
+    app_id: u32,
+    depot_id: u32,
+    inner: OnceCell<AuthCtx>,
+}
+
+struct AuthCtx {
+    client: Arc<DepotClient>,
+    depot_key: DepotKey,
+    cdn_servers: Vec<CdnServer>,
+}
+
+impl Auth {
+    /// Defers login if a refresh token is cached (silent), otherwise logs in
+    /// eagerly so any Steam-Guard prompt happens up front instead of mid-run.
+    async fn prepare(
+        account: String,
+        password: String,
+        app_id: u32,
+        depot_id: u32,
+    ) -> Result<Arc<Self>> {
+        let inner = if login::has_refresh_token(&account) {
+            tracing::info!(account, "refresh token cached, auth will run lazily");
+            OnceCell::new()
+        } else {
+            tracing::info!(
+                account,
+                "no refresh token cached, logging in eagerly (may prompt for steam guard)"
+            );
+            let ctx = authenticate(&account, &password, app_id, depot_id).await?;
+            OnceCell::new_with(Some(ctx))
+        };
+        Ok(Arc::new(Self {
+            account,
+            password,
+            app_id,
+            depot_id,
+            inner,
+        }))
+    }
+
+    async fn get(&self) -> Result<&AuthCtx> {
+        self.inner
+            .get_or_try_init(|| {
+                authenticate(&self.account, &self.password, self.app_id, self.depot_id)
+            })
+            .await
+    }
+}
+
+async fn authenticate(
+    account: &str,
+    password: &str,
+    app_id: u32,
+    depot_id: u32,
+) -> Result<AuthCtx> {
+    tracing::info!("establishing connection");
+    let connection: Connection = login::establish_connection(account, password).await?;
+    let client = Arc::new(DepotClient::new(connection));
+    tracing::info!(app_id, depot_id, "fetching depot key");
+    let depot_key = client.depot_key(app_id, depot_id).await?;
+    tracing::info!("discovering cdn servers");
+    let cdn_servers = client.cdn_servers().await?;
+    tracing::info!(count = cdn_servers.len(), "got cdn servers");
+    Ok(AuthCtx {
+        client,
+        depot_key,
+        cdn_servers,
+    })
+}
+
+/// `ChunkStore` that lazily builds its inner `SteamCdnChunkStore` on the first
+/// miss. Until something actually needs a chunk, no Steam calls happen.
+struct CdnStore {
+    auth: Arc<Auth>,
+    depot_id: u32,
+    manifest: Arc<Manifest>,
+    inner: OnceCell<SteamCdnChunkStore>,
+}
+
+impl CdnStore {
+    fn new(auth: Arc<Auth>, depot_id: u32, manifest: Arc<Manifest>) -> Self {
+        Self {
+            auth,
+            depot_id,
+            manifest,
+            inner: OnceCell::new(),
+        }
+    }
+}
+
+impl ChunkStore for CdnStore {
+    fn get(
+        &self,
+        sha: ChunkSha,
+    ) -> impl Future<Output = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send {
+        async move {
+            let inner = self
+                .inner
+                .get_or_try_init(|| async {
+                    let ctx = self.auth.get().await.map_err(
+                        |e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() },
+                    )?;
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(SteamCdnChunkStore::new(
+                        Arc::clone(&ctx.client),
+                        ctx.cdn_servers.clone(),
+                        self.depot_id,
+                        ctx.depot_key.clone(),
+                        &self.manifest,
+                    ))
+                })
+                .await?;
+            inner.get(sha).await
+        }
+    }
+}
+
 mod login {
     use std::collections::HashMap;
     use std::fs;
@@ -142,6 +269,9 @@ mod login {
         let raw = fs::read_to_string(refresh_token_path()).ok()?;
         let map: HashMap<String, String> = serde_json::from_str(&raw).ok()?;
         map.get(account).cloned().filter(|t| !t.is_empty())
+    }
+    pub fn has_refresh_token(account: &str) -> bool {
+        load(account).is_some()
     }
     fn save(account: &str, token: &str) -> Result<()> {
         let path = refresh_token_path();
