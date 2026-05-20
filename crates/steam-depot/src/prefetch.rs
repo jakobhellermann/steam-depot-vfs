@@ -154,7 +154,7 @@ where
     // we just pre-credited don't poison the first few seconds of
     // rate display.
     pb.reset_eta();
-    pb.enable_steady_tick(std::time::Duration::from_millis(250));
+    pb.enable_steady_tick(std::time::Duration::from_millis(1000));
 
     // Each chunk fetch is its own `tokio::spawn`'d task so the
     // tokio scheduler can distribute work across worker threads

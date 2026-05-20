@@ -5,6 +5,7 @@
 mod auth;
 mod config;
 mod prefetch;
+mod prune;
 mod stats;
 
 use std::fs::File;
@@ -71,6 +72,13 @@ enum Cmd {
     /// Print local-cache stats: which manifests are how completely
     /// downloaded, total bytes on disk, etc. No network access.
     Stats,
+    /// Delete every cached chunk. Manifests on disk are kept (they're
+    /// tiny and offline-replayable). No network access.
+    Prune {
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -83,7 +91,7 @@ fn main() -> anyhow::Result<()> {
         // keeping the bar intact. Warn-only for chunk_store keeps the
         // output focused on progress and real failures.
         Cmd::Prefetch { .. } => "info,steam_depot_vfs::chunk_store=warn,fuser=error",
-        Cmd::Stats => "warn",
+        Cmd::Stats | Cmd::Prune { .. } => "warn",
     };
     // Display filter is per-fmt-layer so we can keep the user-facing
     // output sparse without starving the perfetto trace of spans.
@@ -92,7 +100,7 @@ fn main() -> anyhow::Result<()> {
 
     let timings_path = match &cli.cmd {
         Cmd::Mount { timings } | Cmd::Prefetch { timings, .. } => timings.clone(),
-        Cmd::Stats => None,
+        Cmd::Stats | Cmd::Prune { .. } => None,
     };
     let perfetto = timings_path
         .as_deref()
@@ -131,6 +139,7 @@ fn main() -> anyhow::Result<()> {
             ..
         } => prefetch::run(cfg, parallelism, seconds),
         Cmd::Stats => stats::run(&cfg),
+        Cmd::Prune { yes } => prune::run(&cfg, yes),
     }
 }
 
