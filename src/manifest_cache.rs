@@ -31,8 +31,8 @@ pub struct ManifestCache {
 }
 
 impl ManifestCache {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
     }
 
     pub fn path_for(&self, depot_id: u32, manifest_id: u64) -> PathBuf {
@@ -191,7 +191,7 @@ impl From<CachedFile> for DepotFile {
 impl From<&Chunk> for CachedChunk {
     fn from(c: &Chunk) -> Self {
         Self {
-            sha: c.sha,
+            sha: c.sha.0,
             crc: c.crc,
             offset: c.offset,
             size_uncompressed: c.size_uncompressed,
@@ -203,7 +203,7 @@ impl From<&Chunk> for CachedChunk {
 impl From<CachedChunk> for Chunk {
     fn from(c: CachedChunk) -> Self {
         Self {
-            sha: c.sha,
+            sha: steam_vent_depot::ChunkHash(c.sha),
             crc: c.crc,
             offset: c.offset,
             size_uncompressed: c.size_uncompressed,

@@ -1,127 +1,124 @@
 //! Browse a Steam depot manifest like a filesystem.
-//!
-//! Usage:
-//!   cargo run --example cat -- <user> <pw> <app_id> <depot_id> <manifest_gid> ls [<path>]
-//!   cargo run --example cat -- <user> <pw> <app_id> <depot_id> <manifest_gid> cat <path>
-//!
-//! `ls` defaults to the root directory if no path is given.
-//!
-//! Example:
-//!   cargo run --example cat -- USER PW 1030300 1030303 7921642076658611197 ls
-//!   cargo run --example cat -- USER PW 1030300 1030303 7921642076658611197 cat \
-//!       "Hollow Knight Silksong_Data/StreamingAssets/aa/AddressablesLink/link.xml"
 
-use std::env::args;
 use std::future::Future;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use bytes::Bytes;
+use anyhow::Result;
+use clap::{Parser, Subcommand};
 use steam_depot_vfs::{
-    ChunkSha, ChunkStore, DepotFs, FileKind, FsCacheStore, ManifestCache, SteamCdnChunkStore,
+    AuthSession, DepotAuth, DepotStore, FileKind, VfsError, chunk_store::ChunkStore,
+    fs::DepotSnapshot,
 };
 use steam_vent::Connection;
-use steam_vent_depot::{CdnServer, DepotClient, DepotKey, Manifest};
+use steam_vent_depot::{CdnServer, DepotClient};
 use tokio::sync::OnceCell;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(about = "Browse a Steam depot manifest like a filesystem")]
+struct Cli {
+    /// Steam account name.
+    account: String,
+    /// Steam password (ignored if a refresh token for this account is cached).
+    password: String,
+    /// Steam app id (e.g. 1030300 for Silksong).
+    app_id: u32,
+    /// Depot id within the app (e.g. 1030303 for the Linux depot).
+    depot_id: u32,
+    /// Manifest GID — look these up on SteamDB.
+    manifest_gid: u64,
+    /// Branch the manifest belongs to; mostly only matters for restricted branches.
+    #[arg(long, default_value = "public")]
+    branch: String,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// List a directory in the depot.
+    Ls {
+        /// Directory path; defaults to the root.
+        #[arg(default_value = "/")]
+        path: String,
+    },
+    /// Stream a single file from the depot to stdout.
+    Cat {
+        /// File path inside the depot.
+        path: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let mut args = args().skip(1);
-    let account = args.next().context("missing username")?;
-    let password = args.next().context("missing password")?;
-    let app_id: u32 = args
-        .next()
-        .context("missing app_id")?
-        .parse()
-        .context("app_id must be a number")?;
-    let depot_id: u32 = args
-        .next()
-        .context("missing depot_id")?
-        .parse()
-        .context("depot_id must be a number")?;
-    let manifest_gid: u64 = args
-        .next()
-        .context("missing manifest_gid")?
-        .parse()
-        .context("manifest_gid must be a number")?;
-    let cmd = args.next().context("missing subcommand (ls|cat)")?;
-    let path = args.next();
-    let branch = std::env::var("BRANCH").unwrap_or_else(|_| "public".into());
+    let cli = Cli::parse();
 
     let store_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("vfs-store");
-    let manifest_cache = ManifestCache::new(store_root.join("manifests"));
 
-    let auth = Auth::prepare(account, password, app_id, depot_id).await?;
+    let auth = Auth::prepare(cli.account, cli.password, cli.app_id, cli.depot_id).await?;
+    let vfs = DepotStore::new(store_root);
+    let fs = vfs
+        .open_depot_manifest(
+            auth,
+            cli.app_id,
+            cli.depot_id,
+            cli.manifest_gid,
+            &cli.branch,
+        )
+        .await?;
 
-    let manifest = match manifest_cache.load(depot_id, manifest_gid)? {
-        Some(m) => m,
-        None => {
-            let ctx = auth.get().await?;
-            tracing::info!(depot_id, manifest_gid, branch, "fetching manifest");
-            let code = ctx
-                .client
-                .manifest_request_code(app_id, depot_id, manifest_gid, &branch)
-                .await?;
-            let m = ctx
-                .client
-                .fetch_manifest(
-                    &ctx.cdn_servers,
-                    depot_id,
-                    manifest_gid,
-                    code,
-                    &ctx.depot_key,
-                )
-                .await?;
-            manifest_cache.save(&m)?;
-            m
-        }
-    };
-
-    let manifest = Arc::new(manifest);
-    let lazy_cdn = CdnStore::new(Arc::clone(&auth), depot_id, Arc::clone(&manifest));
-    let store = FsCacheStore::new(lazy_cdn, store_root.join("chunks"));
-
-    let fs = DepotFs::new(
-        Arc::try_unwrap(manifest).unwrap_or_else(|a| (*a).clone()),
-        store,
-    );
-
-    match cmd.as_str() {
-        "ls" => {
-            let p = path.as_deref().unwrap_or("/");
-            let mut entries = fs.list_dir(p)?;
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
-            for e in entries {
-                let marker = match e.meta.kind {
-                    FileKind::Directory => "d",
-                    FileKind::Symlink => "l",
-                    FileKind::File => "f",
-                };
-                let size = if matches!(e.meta.kind, FileKind::File) {
-                    e.meta.size.to_string()
-                } else {
-                    "-".into()
-                };
-                println!("{marker} {:>12} {}", size, e.name);
-            }
-        }
-        "cat" => {
-            let p = path.context("cat requires a file path")?;
-            let bytes = fs.read_full(&p).await?;
-            std::io::stdout().write_all(&bytes)?;
-        }
-        other => anyhow::bail!("unknown subcommand: {other} (expected ls|cat)"),
+    match cli.cmd {
+        Cmd::Ls { path } => ls(&fs, &path)?,
+        Cmd::Cat { path } => cat(&fs, &path).await?,
     }
+    Ok(())
+}
+
+fn ls(fs: &DepotSnapshot<impl ChunkStore>, path: &str) -> Result<()> {
+    let mut entries = fs.list_dir(path)?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in entries {
+        let marker = match e.meta.kind {
+            FileKind::Directory => "d",
+            FileKind::Symlink => "l",
+            FileKind::File => "f",
+        };
+        let size = if matches!(e.meta.kind, FileKind::File) {
+            human_bytes(e.meta.size)
+        } else {
+            "-".into()
+        };
+        println!("{marker} {:>10} {}", size, e.name);
+    }
+    Ok(())
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+async fn cat(fs: &DepotSnapshot<impl ChunkStore>, path: &str) -> Result<()> {
+    let bytes = fs.read_full(path).await?;
+    std::io::stdout().write_all(&bytes)?;
     Ok(())
 }
 
@@ -132,13 +129,7 @@ struct Auth {
     password: String,
     app_id: u32,
     depot_id: u32,
-    inner: OnceCell<AuthCtx>,
-}
-
-struct AuthCtx {
-    client: Arc<DepotClient>,
-    depot_key: DepotKey,
-    cdn_servers: Vec<CdnServer>,
+    inner: OnceCell<AuthSession>,
 }
 
 impl Auth {
@@ -169,13 +160,19 @@ impl Auth {
             inner,
         }))
     }
+}
 
-    async fn get(&self) -> Result<&AuthCtx> {
-        self.inner
-            .get_or_try_init(|| {
-                authenticate(&self.account, &self.password, self.app_id, self.depot_id)
-            })
-            .await
+impl DepotAuth for Auth {
+    fn resolve(&self) -> impl Future<Output = Result<AuthSession, VfsError>> + Send {
+        async move {
+            self.inner
+                .get_or_try_init(|| {
+                    authenticate(&self.account, &self.password, self.app_id, self.depot_id)
+                })
+                .await
+                .cloned()
+                .map_err(|e: anyhow::Error| VfsError::Other(e.to_string().into()))
+        }
     }
 }
 
@@ -184,66 +181,20 @@ async fn authenticate(
     password: &str,
     app_id: u32,
     depot_id: u32,
-) -> Result<AuthCtx> {
+) -> Result<AuthSession> {
     tracing::info!("establishing connection");
     let connection: Connection = login::establish_connection(account, password).await?;
     let client = Arc::new(DepotClient::new(connection));
     tracing::info!(app_id, depot_id, "fetching depot key");
     let depot_key = client.depot_key(app_id, depot_id).await?;
     tracing::info!("discovering cdn servers");
-    let cdn_servers = client.cdn_servers().await?;
+    let cdn_servers: Arc<[CdnServer]> = client.cdn_servers().await?.into();
     tracing::info!(count = cdn_servers.len(), "got cdn servers");
-    Ok(AuthCtx {
+    Ok(AuthSession {
         client,
         depot_key,
         cdn_servers,
     })
-}
-
-/// `ChunkStore` that lazily builds its inner `SteamCdnChunkStore` on the first
-/// miss. Until something actually needs a chunk, no Steam calls happen.
-struct CdnStore {
-    auth: Arc<Auth>,
-    depot_id: u32,
-    manifest: Arc<Manifest>,
-    inner: OnceCell<SteamCdnChunkStore>,
-}
-
-impl CdnStore {
-    fn new(auth: Arc<Auth>, depot_id: u32, manifest: Arc<Manifest>) -> Self {
-        Self {
-            auth,
-            depot_id,
-            manifest,
-            inner: OnceCell::new(),
-        }
-    }
-}
-
-impl ChunkStore for CdnStore {
-    fn get(
-        &self,
-        sha: ChunkSha,
-    ) -> impl Future<Output = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send {
-        async move {
-            let inner = self
-                .inner
-                .get_or_try_init(|| async {
-                    let ctx = self.auth.get().await.map_err(
-                        |e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() },
-                    )?;
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(SteamCdnChunkStore::new(
-                        Arc::clone(&ctx.client),
-                        ctx.cdn_servers.clone(),
-                        self.depot_id,
-                        ctx.depot_key.clone(),
-                        &self.manifest,
-                    ))
-                })
-                .await?;
-            inner.get(sha).await
-        }
-    }
 }
 
 mod login {

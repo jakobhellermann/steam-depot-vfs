@@ -8,10 +8,17 @@ pub enum VfsError {
     NotAFile(String),
     #[error("read past end of file (size={size}, offset={offset})")]
     OutOfRange { size: u64, offset: u64 },
-    #[error("chunk store error: {0}")]
-    ChunkStore(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("chunk {0} not present in manifest index")]
+    ChunkNotInManifest(steam_vent_depot::ChunkHash),
+    /// Escape hatch for [`ChunkStore`](crate::chunk_store::ChunkStore) impls
+    /// that need to wrap an error from a non-Steam source (custom transports,
+    /// alternative caches, …). Built-in impls don't use this.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     Depot(#[from] steam_vent_depot::DepotError),
+    #[error(transparent)]
+    ManifestCache(#[from] crate::manifest_cache::CacheError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

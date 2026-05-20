@@ -1,22 +1,44 @@
-//! Programmatic, file-system-shaped access to a Steam depot manifest.
+//! Programmatic, file-system-shaped access to a Steam depot manifest, with
+//! transparent local caching of manifests and chunks.
 //!
-//! Given a parsed [`steam_vent_depot::Manifest`] and a [`ChunkStore`] (something
-//! that turns chunk SHAs into bytes), you can read individual files, slice
-//! arbitrary byte ranges, and walk the directory tree — without materialising
-//! the whole depot on disk.
+//! # Entry points
 //!
-//! See `examples/cat.rs` for end-to-end usage. Mount-style frontends (FUSE,
-//! WebDAV, …) live in their own examples and use the same API.
+//! - [`DepotStore`] — owns the on-disk cache (manifests + chunks) and is the
+//!   high-level entry point. Call [`DepotStore::open_depot_manifest`] with auth + ids to get
+//!   back a ready-to-use [`fs::DepotSnapshot`].
+//! - [`fs::DepotSnapshot`] — file-system view over a single manifest. Provides
+//!   `list_dir`, `metadata`, `read`, `read_full`.
+//!
+//! # Auth
+//!
+//! Steam access goes through the [`DepotAuth`] trait, which yields an
+//! [`AuthSession`] (client + depot key + CDN servers) on demand. Implement
+//! it for whatever lazy/eager login flow you want — the lib stays out of the
+//! login policy.
+//!
+//! # Chunk plumbing
+//!
+//! Most users don't touch this — [`DepotStore::open_depot_manifest`] wires it up. The pieces
+//! live in [`chunk_store`]:
+//! [`ChunkStore`](chunk_store::ChunkStore) trait,
+//! [`CdnChunkStore`](chunk_store::CdnChunkStore) (Steam-CDN-backed), and
+//! [`FsCacheStore`](chunk_store::FsCacheStore) (write-through local cache).
+//!
+//! # Examples
+//!
+//! See `examples/cat.rs` for an end-to-end CLI. Mount-style frontends (FUSE,
+//! WebDAV, …) live in further examples and reuse `DepotSnapshot`.
 
-mod chunk_store;
-mod depot_fs;
+mod auth;
+pub mod chunk_store;
+mod context;
 mod error;
+pub mod fs;
 mod manifest_cache;
-mod sha;
 
-pub use chunk_store::{ChunkStore, FsCacheStore, SteamCdnChunkStore};
-pub use depot_fs::{DepotFs, Entry, FileMeta};
+pub use auth::{AuthSession, DepotAuth};
+pub use context::DepotStore;
 pub use error::{Result, VfsError};
-pub use manifest_cache::{CacheError, ManifestCache};
-pub use sha::ChunkSha;
+pub use manifest_cache::CacheError;
+pub use steam_vent_depot::ChunkHash;
 pub use steam_vent_depot::FileKind;

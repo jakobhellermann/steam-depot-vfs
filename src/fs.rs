@@ -9,7 +9,6 @@ use steam_vent_depot::{DepotFile, FileKind, Manifest};
 
 use crate::chunk_store::ChunkStore;
 use crate::error::{Result, VfsError};
-use crate::sha::ChunkSha;
 
 /// Cheap metadata for a file/directory/symlink entry.
 #[derive(Debug, Clone)]
@@ -19,7 +18,7 @@ pub struct FileMeta {
     pub linktarget: Option<String>,
 }
 
-/// A directory entry returned by [`DepotFs::list_dir`].
+/// A directory entry returned by [`DepotSnapshot::list_dir`].
 #[derive(Debug, Clone)]
 pub struct Entry {
     /// Last path component.
@@ -27,8 +26,11 @@ pub struct Entry {
     pub meta: FileMeta,
 }
 
-/// File-system-style view over a single manifest.
-pub struct DepotFs<C: ChunkStore> {
+/// File-system-style view over a single depot manifest.
+///
+/// Created via [`crate::DepotStore::open_depot_manifest`] (recommended) or directly with
+/// [`DepotSnapshot::new`] if you want to bring your own chunk store.
+pub struct DepotSnapshot<C: ChunkStore> {
     manifest: Arc<Manifest>,
     /// path -> index into `manifest.files`.
     by_path: HashMap<String, usize>,
@@ -37,9 +39,8 @@ pub struct DepotFs<C: ChunkStore> {
     chunks: C,
 }
 
-impl<C: ChunkStore> DepotFs<C> {
-    pub fn new(manifest: Manifest, chunks: C) -> Self {
-        let manifest = Arc::new(manifest);
+impl<C: ChunkStore> DepotSnapshot<C> {
+    pub fn new(manifest: Arc<Manifest>, chunks: C) -> Self {
         let mut by_path = HashMap::with_capacity(manifest.files.len());
         let mut children: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, f) in manifest.files.iter().enumerate() {
@@ -154,12 +155,15 @@ impl<C: ChunkStore> DepotFs<C> {
         );
         let mut out = Vec::with_capacity(want_len);
 
-        // Chunks may be stored in any order; sort by file offset for easier
-        // skip-logic. Typically the manifest already gives them in order.
-        let mut chunks: Vec<&steam_vent_depot::Chunk> = f.chunks.iter().collect();
-        chunks.sort_by_key(|c| c.offset);
+        // Chunks are always serialised in offset order by Steam; we rely on
+        // that for skip-logic below (`break` when past `end`).
+        debug_assert!(
+            f.chunks.is_sorted_by_key(|c| c.offset),
+            "manifest chunks for {} not in offset order",
+            f.path,
+        );
 
-        for c in chunks {
+        for c in &f.chunks {
             let c_start = c.offset;
             let c_end = c.offset + c.size_uncompressed as u64;
             if c_end <= offset {
@@ -168,11 +172,7 @@ impl<C: ChunkStore> DepotFs<C> {
             if c_start >= end {
                 break;
             }
-            let bytes = self
-                .chunks
-                .get(ChunkSha(c.sha))
-                .await
-                .map_err(VfsError::ChunkStore)?;
+            let bytes = self.chunks.get(c.sha).await?;
             let slice_start = offset.saturating_sub(c_start) as usize;
             let slice_end = (end.min(c_end) - c_start) as usize;
             out.extend_from_slice(&bytes[slice_start..slice_end]);
