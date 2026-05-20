@@ -18,5 +18,10 @@ clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
 serde_json = "1.0.149"
 steam-vent = "0.5.0"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "fs", "io-util", "signal"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+async-trait = "0.1.89"
+fuser = { version = "0.17.0", features = ["experimental"] }
+libc = "0.2.186"

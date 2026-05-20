@@ -66,6 +66,13 @@ impl<C: ChunkStore> DepotSnapshot<C> {
         &self.manifest
     }
 
+    /// Index into [`Manifest::files`] for `path`, if present. The empty path
+    /// and `"/"` are *not* valid here — they refer to the synthetic root, which
+    /// has no entry in `manifest.files`.
+    pub fn index_of(&self, path: &str) -> Option<usize> {
+        self.by_path.get(strip_leading_slash(path)).copied()
+    }
+
     pub fn metadata(&self, path: &str) -> Result<FileMeta> {
         if path.is_empty() || path == "/" {
             return Ok(FileMeta {
@@ -155,13 +162,9 @@ impl<C: ChunkStore> DepotSnapshot<C> {
         );
         let mut out = Vec::with_capacity(want_len);
 
-        // Chunks are always serialised in offset order by Steam; we rely on
-        // that for skip-logic below (`break` when past `end`).
-        debug_assert!(
-            f.chunks.is_sorted_by_key(|c| c.offset),
-            "manifest chunks for {} not in offset order",
-            f.path,
-        );
+        // `DepotFile::chunks` is sorted by offset (enforced upstream), so we
+        // can `break` once we're past `end`.
+        debug_assert!(f.chunks.is_sorted_by_key(|c| c.offset));
 
         for c in &f.chunks {
             let c_start = c.offset;
