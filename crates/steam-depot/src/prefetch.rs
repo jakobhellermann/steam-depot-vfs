@@ -4,6 +4,7 @@
 //! until something asks for a file; this is the "warm me up" knob.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -14,12 +15,15 @@ use steam_depot_vfs::{ChunkHash, DepotStore, SteamAuth};
 use crate::auth::Auth;
 use crate::config::Config;
 
-/// Max concurrent in-flight CDN fetches. Each fetch is a single HTTPS
-/// request, and Steam's CDN is happy with a handful; staying small keeps
-/// the progress logs interpretable and avoids hammering the server.
-const PARALLELISM: usize = 8;
+/// Default max concurrent in-flight CDN fetches. DepotDownloader uses
+/// 8 (or 25 with `-validate-all`); 16 is a middle ground that
+/// noticeably improves throughput on most connections without hammering
+/// Steam.
+const DEFAULT_PARALLELISM: usize = 16;
 
-pub fn run(cfg: Config) -> Result<()> {
+pub fn run(cfg: Config, parallelism: Option<usize>, seconds: Option<u64>) -> Result<()> {
+    let parallelism = parallelism.unwrap_or(DEFAULT_PARALLELISM).max(1);
+    let max_duration = seconds.map(std::time::Duration::from_secs);
     std::fs::create_dir_all(&cfg.store_root)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -49,7 +53,10 @@ pub fn run(cfg: Config) -> Result<()> {
             let snapshot = store
                 .open_depot_manifest(auth.clone(), m.app_id, m.depot_id, m.gid, &m.branch)
                 .await?;
-            prefetch_snapshot(&snapshot, &cached).await?;
+            // `Arc` so each spawned per-chunk task can hold a cheap
+            // clone of the snapshot without borrowing across the spawn.
+            let snapshot = Arc::new(snapshot);
+            prefetch_snapshot(snapshot, &cached, parallelism, max_duration).await?;
         }
         Ok::<_, anyhow::Error>(())
     })
@@ -85,11 +92,13 @@ fn parse_sha(s: &str) -> Option<ChunkHash> {
 }
 
 async fn prefetch_snapshot<C>(
-    snapshot: &steam_depot_vfs::fs::DepotSnapshot<C>,
+    snapshot: Arc<steam_depot_vfs::fs::DepotSnapshot<C>>,
     already_cached: &HashSet<ChunkHash>,
+    parallelism: usize,
+    max_duration: Option<std::time::Duration>,
 ) -> Result<()>
 where
-    C: ChunkStore + 'static,
+    C: ChunkStore + Send + Sync + 'static,
 {
     let manifest = snapshot.manifest();
 
@@ -147,11 +156,12 @@ where
     pb.reset_eta();
     pb.enable_steady_tick(std::time::Duration::from_millis(250));
 
-    // `ChunkStore::get` returns `impl Future`, not dyn-compatible — so
-    // a single shared `Arc<dyn>` is out. Instead, drive the work with
-    // a bounded `FuturesUnordered` keyed by sha + compressed size.
+    // Each chunk fetch is its own `tokio::spawn`'d task so the
+    // tokio scheduler can distribute work across worker threads
+    // (otherwise `FuturesUnordered` polls everything on one task =
+    // one worker thread, which made the single-thread CPU
+    // bottleneck visible in the perfetto trace).
     use futures::stream::{FuturesUnordered, StreamExt};
-    let chunks = snapshot.chunks();
 
     // Stable order makes the trace easier to read across runs.
     let mut work: Vec<_> = unique.into_iter().collect();
@@ -160,48 +170,129 @@ where
     let mut in_flight = FuturesUnordered::new();
     let mut iter = work.into_iter();
 
+    let spawn_one = |sha, size| {
+        let snapshot = Arc::clone(&snapshot);
+        tokio::spawn(async move {
+            let r = snapshot
+                .chunks()
+                .ensure(sha)
+                .await
+                .map_err(anyhow::Error::from);
+            (sha, size, r)
+        })
+    };
+
     // Prime the pipeline.
-    for _ in 0..PARALLELISM {
+    for _ in 0..parallelism {
         if let Some((sha, size)) = iter.next() {
-            in_flight.push(fetch_one(chunks, sha, size));
+            in_flight.push(spawn_one(sha, size));
         }
     }
     let mut chunks_done: u64 = 0;
     let mut bytes_done: u64 = 0;
-    while let Some(res) = in_flight.next().await {
-        let (sha, size, outcome) = res;
-        match outcome {
-            Ok(()) => {
-                chunks_done += 1;
-                bytes_done += size;
-                pb.inc(size);
+    // On Ctrl-C / SIGTERM (or an explicit `--seconds` deadline) we
+    // stop submitting new fetches but keep draining the in-flight ones
+    // so their writes commit cleanly.
+    let mut shutdown = std::pin::pin!(async move {
+        match max_duration {
+            Some(d) => {
+                tokio::select! {
+                    _ = wait_for_term_signal() => {}
+                    _ = tokio::time::sleep(d) => {}
+                }
             }
-            Err(e) => {
-                tracing::warn!(%sha, %e, "chunk fetch failed");
-            }
+            None => wait_for_term_signal().await,
         }
-        if let Some((sha, size)) = iter.next() {
-            in_flight.push(fetch_one(chunks, sha, size));
+    });
+    let mut interrupted = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown, if !interrupted => {
+                let reason = if max_duration.is_some() {
+                    "time limit reached, draining in-flight fetches"
+                } else {
+                    "interrupted, draining in-flight fetches"
+                };
+                tracing::info!(reason);
+                interrupted = true;
+            }
+            res = in_flight.next() => {
+                let Some(joined) = res else { break };
+                let (sha, size, outcome) = match joined {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(%e, "fetch task panicked");
+                        continue;
+                    }
+                };
+                match outcome {
+                    Ok(()) => {
+                        chunks_done += 1;
+                        bytes_done += size;
+                        pb.inc(size);
+                    }
+                    Err(e) => {
+                        tracing::warn!(%sha, %e, "chunk fetch failed");
+                    }
+                }
+                if !interrupted && let Some((sha, size)) = iter.next() {
+                    in_flight.push(spawn_one(sha, size));
+                }
+            }
         }
     }
 
     pb.finish_and_clear();
     let elapsed = started.elapsed();
-    tracing::info!(
-        manifest_id = manifest.manifest_id,
-        chunks = chunks_done,
-        bytes_compressed = bytes_done,
-        elapsed_secs = elapsed.as_secs_f64(),
-        "prefetch complete",
+    let secs = elapsed.as_secs_f64().max(1e-3);
+    let rate = bytes_done as f64 / secs;
+    println!(
+        "manifest {} — {} / {} in {:.1}s  ({}/s, {}/{} chunks){}",
+        manifest.manifest_id,
+        human_bytes(bytes_done),
+        human_bytes(new_bytes),
+        secs,
+        human_bytes(rate as u64),
+        chunks_done,
+        total_chunks,
+        if interrupted { "  [interrupted]" } else { "" },
     );
+    // Hitting a `--seconds` deadline is a normal exit; only an
+    // out-of-band signal counts as failure.
+    if interrupted && max_duration.is_none() {
+        anyhow::bail!("prefetch interrupted by signal");
+    }
     Ok(())
 }
 
-async fn fetch_one<C: ChunkStore>(
-    chunks: &C,
-    sha: steam_depot_vfs::ChunkHash,
-    size: u64,
-) -> (steam_depot_vfs::ChunkHash, u64, anyhow::Result<()>) {
-    let r = chunks.ensure(sha).await.map_err(anyhow::Error::from);
-    (sha, size, r)
+fn human_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Wait for SIGINT or SIGTERM, whichever comes first.
+async fn wait_for_term_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+        // If we can't install the SIGTERM handler we fall back to
+        // SIGINT only — losing a bit of robustness rather than failing
+        // the whole prefetch over signal-handler setup.
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
 }

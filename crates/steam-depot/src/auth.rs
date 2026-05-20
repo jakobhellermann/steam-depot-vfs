@@ -113,6 +113,8 @@ fn save(account: &str, token: &str) -> Result<()> {
 
 async fn establish_connection(account: &str, password: &str) -> Result<Connection> {
     tracing::info!(account, "discovering steam servers");
+    // Cell IDs are Steam's geographic regions. 4 = Frankfurt (DE).
+    // Full list: https://raw.githubusercontent.com/SteamDatabase/SteamTracking/6d23ebb0070998ae851278cfae5f38832f4ac28d/ClientExtracted/steam/cached/CellMap.vdf
     let server_list = ServerList::discover_with(DiscoverOptions::default().with_cell(4)).await?;
     if let Some(t) = load(account) {
         tracing::info!(account, "trying cached refresh token");

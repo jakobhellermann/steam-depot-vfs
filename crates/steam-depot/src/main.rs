@@ -57,6 +57,16 @@ enum Cmd {
             default_missing_value = "trace.pftrace",
         )]
         timings: Option<PathBuf>,
+        /// Max concurrent CDN requests. Default: 16. Higher trades
+        /// memory + Steam-side fairness for throughput; DepotDownloader
+        /// uses 8–25.
+        #[arg(short = 'j', long, value_name = "N")]
+        parallelism: Option<usize>,
+        /// Stop after this many seconds (cleanly drains in-flight
+        /// fetches first, same as Ctrl-C). Useful for bounded
+        /// benchmarking — pair with `--timings`.
+        #[arg(long, value_name = "SECS")]
+        seconds: Option<u64>,
     },
     /// Print local-cache stats: which manifests are how completely
     /// downloaded, total bytes on disk, etc. No network access.
@@ -81,7 +91,7 @@ fn main() -> anyhow::Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into());
 
     let timings_path = match &cli.cmd {
-        Cmd::Mount { timings } | Cmd::Prefetch { timings } => timings.clone(),
+        Cmd::Mount { timings } | Cmd::Prefetch { timings, .. } => timings.clone(),
         Cmd::Stats => None,
     };
     let perfetto = timings_path
@@ -115,7 +125,11 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config::from_file(&cli.config)?;
     match cli.cmd {
         Cmd::Mount { .. } => mount(cfg),
-        Cmd::Prefetch { .. } => prefetch::run(cfg),
+        Cmd::Prefetch {
+            parallelism,
+            seconds,
+            ..
+        } => prefetch::run(cfg, parallelism, seconds),
         Cmd::Stats => stats::run(&cfg),
     }
 }
