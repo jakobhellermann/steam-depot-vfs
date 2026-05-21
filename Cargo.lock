@@ -2669,8 +2669,6 @@ dependencies = [
  "steam-vent-proto",
  "steam-vent-proto-common",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
  "vdf-reader",
  "zip",
  "zstd",

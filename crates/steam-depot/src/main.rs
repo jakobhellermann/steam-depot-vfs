@@ -14,12 +14,15 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "linux")]
 use steam_depot_mount::{Mount, MountConfig};
+#[cfg(target_os = "linux")]
 use steam_depot_vfs::DepotStore;
 use tracing_indicatif::IndicatifLayer;
 use tracing_perfetto::PerfettoLayer;
 use tracing_subscriber::{EnvFilter, prelude::*};
 
+#[cfg(target_os = "linux")]
 use crate::auth::Auth;
 use crate::config::Config;
 
@@ -36,6 +39,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Mount the depots in the config and run until SIGINT/SIGTERM.
+    /// Linux only.
     Mount {
         /// Write a Perfetto trace of every FUSE op and chunk fetch.
         /// Bare `--timings` writes to `./trace.pftrace`; pass a path to
@@ -156,6 +160,12 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn mount(_cfg: Config) -> anyhow::Result<()> {
+    anyhow::bail!("`mount` is only supported on linux");
+}
+
+#[cfg(target_os = "linux")]
 fn mount(cfg: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.mountpoint)?;
     std::fs::create_dir_all(&cfg.store_root)?;

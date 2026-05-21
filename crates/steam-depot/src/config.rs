@@ -29,6 +29,7 @@ use serde::Deserialize;
 /// [`RawConfig`] which mirrors the on-disk TOML.
 #[derive(Debug)]
 pub struct Config {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub mountpoint: PathBuf,
     pub store_root: PathBuf,
     pub steam: Steam,

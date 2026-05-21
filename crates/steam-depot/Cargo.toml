@@ -17,7 +17,6 @@ indicatif = "0.18.0"
 tracing-indicatif = "0.3.13"
 serde.workspace = true
 serde_json.workspace = true
-steam-depot-mount = { path = "../steam-depot-mount" }
 steam-depot-vfs = { path = "../steam-depot-vfs" }
 steam-vent.workspace = true
 steam-vent-depot.workspace = true
@@ -27,3 +26,6 @@ toml.workspace = true
 tracing.workspace = true
 tracing-perfetto = "0.1.5"
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+steam-depot-mount = { path = "../steam-depot-mount" }
