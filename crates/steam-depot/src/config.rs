@@ -83,13 +83,20 @@ impl Config {
                 manifests.push(parse_manifest_entry(d.app_id, d.depot_id, entry)?);
             }
         }
+        // Relative paths in the config resolve against the config file's
+        // parent directory, so the same config works from any CWD.
+        let base = path.parent().unwrap_or(std::path::Path::new(""));
         Ok(Config {
-            mountpoint: raw.mountpoint,
-            store_root: raw.store_root,
+            mountpoint: resolve(base, raw.mountpoint),
+            store_root: resolve(base, raw.store_root),
             steam: raw.steam,
             manifests,
         })
     }
+}
+
+fn resolve(base: &std::path::Path, p: PathBuf) -> PathBuf {
+    if p.is_absolute() { p } else { base.join(p) }
 }
 
 /// Parse a `"<gid>"` or `"<gid>:<branch>"` string from a `manifests`

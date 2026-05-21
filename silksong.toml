@@ -1,8 +1,8 @@
 # mountpoint = "/tmp/steam"
 # store_root = "/tmp/steam-vfs-store"
 
-mountpoint = "/home/jakob/dev/rust/contrib/steam/steam-depot-vfs/target/steam"
-store_root = "/home/jakob/dev/rust/contrib/steam/steam-depot-vfs/target/steam-vfs-store"
+mountpoint = "target/steam"
+store_root = "target/steam-vfs-store"
 
 [steam]
 account = "jjakobh"
