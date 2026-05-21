@@ -19,7 +19,7 @@ use crate::error::Result;
 /// Resolved Steam connection plus CDN host list. Cheap to clone.
 #[derive(Clone)]
 pub struct SteamSession {
-    pub client: Arc<DepotClient>,
+    pub client: DepotClient,
     pub cdn_servers: Arc<[CdnServer]>,
 }
 

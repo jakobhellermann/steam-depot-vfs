@@ -167,7 +167,7 @@ impl SteamAuth for Auth {
 async fn authenticate(account: &str, password: &str) -> Result<SteamSession> {
     tracing::info!("establishing connection");
     let connection: Connection = login::establish_connection(account, password).await?;
-    let client = Arc::new(DepotClient::new(connection));
+    let client = DepotClient::new(connection);
     tracing::info!("discovering cdn servers");
     let cdn_servers: Arc<[CdnServer]> = client.cdn_servers().await?.into();
     tracing::info!(count = cdn_servers.len(), "got cdn servers");
