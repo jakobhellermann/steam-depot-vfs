@@ -21,10 +21,25 @@ use crate::Result;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
+    #[error("{op} `{}`", path.display())]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("postcard encode: {0}")]
     Encode(#[from] postcard::Error),
+}
+
+impl CacheError {
+    fn io(op: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            op,
+            path: path.into(),
+            source,
+        }
+    }
 }
 
 pub struct ManifestCache {
@@ -47,7 +62,7 @@ impl ManifestCache {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(CacheError::io("reading", path, e)),
         };
         let cached: CachedManifest = postcard::from_bytes(&bytes)?;
         tracing::debug!(
@@ -62,13 +77,13 @@ impl ManifestCache {
     pub fn save(&self, manifest: &Manifest) -> Result<(), CacheError> {
         let path = self.path_for(manifest.depot_id, manifest.manifest_id);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| CacheError::io("creating", parent, e))?;
         }
         let bytes = postcard::to_allocvec(&CachedManifest::from(manifest))?;
         // Write-then-rename for atomicity.
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        std::fs::write(&tmp, &bytes).map_err(|e| CacheError::io("writing", &tmp, e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| CacheError::io("renaming to", &path, e))?;
         tracing::info!(
             depot_id = manifest.depot_id,
             manifest_id = manifest.manifest_id,
