@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use steam_vent_depot::DepotKey;
+use steam_vent_depot::{ChunkHash, DepotKey};
 use tokio::sync::OnceCell;
 
 use crate::auth::SteamAuth;
@@ -105,6 +105,68 @@ impl DepotStore {
     /// cache management tools.
     pub fn chunks_root(&self) -> PathBuf {
         self.root.join("chunks")
+    }
+
+    /// Root directory of the on-disk manifest postcard cache. Layout
+    /// underneath is `<manifests_root>/<depot_id>/<gid>.postcard`.
+    pub fn manifests_root(&self) -> PathBuf {
+        self.root.join("manifests")
+    }
+
+    /// Enumerate every chunk currently stored on disk. Stray files whose
+    /// names don't parse as a hex chunk hash are silently skipped. Returns
+    /// an empty iterator if the chunks dir doesn't exist yet.
+    pub fn list_chunks(&self) -> std::io::Result<impl Iterator<Item = std::io::Result<ChunkHash>>> {
+        let dir = self.chunks_root();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => Some(e),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        Ok(entries.into_iter().flatten().filter_map(|res| match res {
+            Err(e) => Some(Err(e)),
+            Ok(entry) => entry
+                .file_name()
+                .to_str()
+                .and_then(ChunkHash::from_hex)
+                .map(Ok),
+        }))
+    }
+
+    /// Enumerate every cached manifest as `(depot_id, manifest_gid)` pairs.
+    /// Stray files / directories with non-numeric names are silently
+    /// skipped. Returns an empty vec if the manifests dir doesn't exist yet.
+    pub fn list_manifests(&self) -> std::io::Result<Vec<(u32, u64)>> {
+        let root = self.manifests_root();
+        let depot_entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        for depot_entry in depot_entries {
+            let depot_entry = depot_entry?;
+            let Some(depot_id) = depot_entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            for manifest_entry in std::fs::read_dir(depot_entry.path())? {
+                let manifest_entry = manifest_entry?;
+                let Some(gid) = manifest_entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.strip_suffix(".postcard"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                out.push((depot_id, gid));
+            }
+        }
+        Ok(out)
     }
 
     /// Get-or-create the shared [`OnceCell`] for a depot's key. The
