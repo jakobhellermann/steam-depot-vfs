@@ -78,7 +78,7 @@ impl<A: SteamAuth> ChunkStore for CdnChunkStore<A> {
             .ok_or_else(|| VfsError::ChunkNotInManifest(sha))?;
         let depot_key = self.resolve_depot_key().await?;
         let ctx = self.auth.resolve().await?;
-        tracing::info!(
+        tracing::debug!(
             %sha,
             size_compressed = chunk.size_compressed,
             "fetching chunk from steam cdn"
