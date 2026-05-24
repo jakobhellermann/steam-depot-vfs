@@ -17,7 +17,6 @@ use steam_depot_vfs::FileKind;
 use steam_depot_vfs::chunk_store::ChunkStore;
 use steam_depot_vfs::fs::Entry;
 use tokio::runtime::Handle;
-use tracing::Instrument as _;
 
 use crate::inode::{self, SYNTHETIC};
 use crate::tree::{MountTree, SnapshotEntry};
@@ -40,7 +39,6 @@ impl<C: ChunkStore + 'static> FuseFs<C> {
 
 impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let _span = tracing::info_span!("fuse.lookup").entered();
         let tree = self.tree.read();
         let Some(name) = name.to_str() else {
             reply.error(Errno::ENOENT);
@@ -59,7 +57,6 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         _fh: Option<fuser::FileHandle>,
         reply: ReplyAttr,
     ) {
-        let _span = tracing::info_span!("fuse.getattr").entered();
         let tree = self.tree.read();
         match attr_for(&tree, ino) {
             Some(attr) => reply.attr(&TTL, &attr),
@@ -75,7 +72,6 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let _span = tracing::info_span!("fuse.readdir").entered();
         let entries = {
             let tree = self.tree.read();
             match collect_dir(&tree, ino) {
@@ -87,28 +83,24 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
             }
         };
 
-        // Cookie semantics match the experimental API: each `reply.add`
-        // is given `offset+1`; the kernel echoes it back on the next
-        // call so we can resume.
-        let mut cookie = 0u64;
-        if cookie >= offset || !reply.add(ino, cookie + 1, FileType::Directory, ".") {
-            cookie += 1;
-        } else {
-            reply.ok();
-            return;
+        // Cookie semantics: each entry is given a `next_offset` that
+        // the kernel echoes back so we can resume. Skip entries whose
+        // cookie is <= the offset the kernel already saw. `reply.add`
+        // returns true when the kernel's buffer is full — stop adding
+        // but still call `reply.ok()` so the kernel knows to come back
+        // (with a higher offset) instead of looping on the same one.
+        let mut all: Vec<(INodeNo, FileType, &str)> = Vec::with_capacity(entries.len() + 2);
+        all.push((ino, FileType::Directory, "."));
+        all.push((ino, FileType::Directory, ".."));
+        for (child_ino, kind, name) in &entries {
+            all.push((*child_ino, *kind, name.as_str()));
         }
-        if cookie >= offset || !reply.add(ino, cookie + 1, FileType::Directory, "..") {
-            cookie += 1;
-        } else {
-            reply.ok();
-            return;
-        }
-        for (child_ino, kind, name) in entries {
-            cookie += 1;
-            if cookie <= offset {
+        for (i, (child_ino, kind, name)) in all.iter().enumerate() {
+            let next_offset = (i + 1) as u64;
+            if next_offset <= offset {
                 continue;
             }
-            if reply.add(child_ino, cookie, kind, &name) {
+            if reply.add(*child_ino, next_offset, *kind, name) {
                 break;
             }
         }
@@ -168,24 +160,20 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         // allowed to return without sending a reply as long as
         // *something* eventually does — so we hand the reply to the
         // task and let it complete out-of-band.
-        let span = tracing::info_span!("fuse.read");
-        self.rt.spawn(
-            async move {
-                let mut buf = Vec::with_capacity(size as usize);
-                match entry
-                    .snapshot
-                    .read_into(&path, offset, size as u64, &mut buf)
-                    .await
-                {
-                    Ok(()) => reply.data(&buf),
-                    Err(e) => {
-                        tracing::warn!(path = %path, offset, size, %e, "read failed");
-                        reply.error(Errno::EIO);
-                    }
+        self.rt.spawn(async move {
+            let mut buf = Vec::with_capacity(size as usize);
+            match entry
+                .snapshot
+                .read_into(&path, offset, size as u64, &mut buf)
+                .await
+            {
+                Ok(()) => reply.data(&buf),
+                Err(e) => {
+                    tracing::warn!(path = %path, offset, size, %e, "read failed");
+                    reply.error(Errno::EIO);
                 }
             }
-            .instrument(span),
-        );
+        });
     }
 
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: fuser::AccessFlags, reply: ReplyEmpty) {
