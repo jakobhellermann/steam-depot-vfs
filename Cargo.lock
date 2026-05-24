@@ -2648,6 +2648,7 @@ dependencies = [
  "aes 0.9.0",
  "base64",
  "cbc 0.2.0",
+ "indexmap",
  "lzma-rs",
  "reqwest",
  "serde",

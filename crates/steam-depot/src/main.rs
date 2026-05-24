@@ -127,19 +127,28 @@ fn main() -> anyhow::Result<()> {
         })
         .transpose()?;
 
-    // Route the fmt layer's writer through indicatif so any active
-    // ProgressBars (currently only the prefetch one) aren't clobbered
-    // by tracing output during the prefetch loop. We turn off the
-    // default span-as-bar behavior so transient framework spans (like
-    // websocket connects in steam-vent) don't flash a bar.
-    let indicatif_layer = IndicatifLayer::new().with_max_progress_bars(0, None);
+    // IndicatifLayer's per-span on_enter/on_new_span allocates a
+    // ProgressBar (incl. default-style parse) and takes a global mutex
+    // on every span entry — fine for the prefetch loop with a handful
+    // of spans, catastrophic for `mount` where lookup/readdir/getattr
+    // spans fire per FUSE op and serialize all FUSE worker threads on
+    // that mutex. So we only register the layer for `prefetch`, which
+    // is also the only subcommand that actually draws bars. The fmt
+    // layer keeps writing to stderr directly elsewhere.
+    let prefetch_indicatif = matches!(cli.cmd, Cmd::Prefetch { .. })
+        .then(|| IndicatifLayer::new().with_max_progress_bars(0, None));
+    let fmt_layer = match &prefetch_indicatif {
+        Some(layer) => tracing_subscriber::fmt::layer()
+            .with_writer(layer.get_stderr_writer())
+            .with_filter(display_filter)
+            .boxed(),
+        None => tracing_subscriber::fmt::layer()
+            .with_filter(display_filter)
+            .boxed(),
+    };
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(indicatif_layer.get_stderr_writer())
-                .with_filter(display_filter),
-        )
-        .with(indicatif_layer)
+        .with(fmt_layer)
+        .with(prefetch_indicatif)
         .with(perfetto)
         .init();
 
