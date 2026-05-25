@@ -24,7 +24,7 @@ pub fn run(cfg: &Config, verify: bool) -> Result<()> {
         .iter()
         .filter(|m| {
             store
-                .load_cached_manifest(m.depot_id, m.gid)
+                .load_cached_manifest(m.app_id, m.depot_id, m.gid)
                 .ok()
                 .flatten()
                 .is_none()
@@ -95,11 +95,11 @@ pub fn run(cfg: &Config, verify: bool) -> Result<()> {
     let mut missing_count: u64 = 0;
     for m in &cfg.manifests {
         let Some(manifest) = store
-            .load_cached_manifest(m.depot_id, m.gid)
+            .load_cached_manifest(m.app_id, m.depot_id, m.gid)
             .with_context(|| {
                 format!(
-                    "loading cached manifest for depot {} gid {}",
-                    m.depot_id, m.gid
+                    "loading cached manifest for app {} depot {} gid {}",
+                    m.app_id, m.depot_id, m.gid
                 )
             })?
         else {

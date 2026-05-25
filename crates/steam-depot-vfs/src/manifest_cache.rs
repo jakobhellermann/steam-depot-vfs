@@ -1,11 +1,15 @@
 // TODO(ai-review): review for correctness/style
 //! Persistent cache for parsed [`Manifest`]s.
 //!
-//! Manifests are immutable for a given `(depot_id, manifest_id)` — Steam
-//! publishes a new GID for every build — so caching them locally avoids the
-//! login + manifest-request-code roundtrip on subsequent runs.
+//! Manifests are immutable for a given `(app_id, depot_id, manifest_id)` —
+//! Steam publishes a new GID for every build — so caching them locally
+//! avoids the login + manifest-request-code roundtrip on subsequent runs.
+//! `app_id` is part of the path so the FUSE mount can reconstruct the
+//! `/<app>/<depot>/<gid>` tree from a fresh cache scan; a depot id alone
+//! is ambiguous because the same depot can belong to multiple apps
+//! (e.g. Steamworks Common Redistributables).
 //!
-//! Layout: `<root>/<depot_id>/<manifest_id>.postcard`.
+//! Layout: `<root>/<app_id>/<depot_id>/<manifest_id>.postcard`.
 //!
 //! Because [`steam_vent_depot::Manifest`] doesn't implement [`serde`], this
 //! module mirrors its fields with a private serde-friendly representation and
@@ -52,14 +56,20 @@ impl ManifestCache {
         Self { root }
     }
 
-    pub fn path_for(&self, depot_id: u32, manifest_id: u64) -> PathBuf {
+    pub fn path_for(&self, app_id: u32, depot_id: u32, manifest_id: u64) -> PathBuf {
         self.root
+            .join(app_id.to_string())
             .join(depot_id.to_string())
             .join(format!("{manifest_id}.postcard"))
     }
 
-    pub fn load(&self, depot_id: u32, manifest_id: u64) -> Result<Option<Manifest>, CacheError> {
-        let path = self.path_for(depot_id, manifest_id);
+    pub fn load(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: u64,
+    ) -> Result<Option<Manifest>, CacheError> {
+        let path = self.path_for(app_id, depot_id, manifest_id);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -67,6 +77,7 @@ impl ManifestCache {
         };
         let cached: CachedManifest = postcard::from_bytes(&bytes)?;
         tracing::debug!(
+            app_id,
             depot_id,
             manifest_id,
             bytes = bytes.len(),
@@ -78,17 +89,18 @@ impl ManifestCache {
     /// decode and end up serialized.
     pub async fn load_async(
         &self,
+        app_id: u32,
         depot_id: u32,
         manifest_id: u64,
     ) -> Result<Option<Manifest>, CacheError> {
         let this = self.clone();
-        tokio::task::spawn_blocking(move || this.load(depot_id, manifest_id))
+        tokio::task::spawn_blocking(move || this.load(app_id, depot_id, manifest_id))
             .await
             .expect("manifest cache load task panicked")
     }
 
-    pub fn save(&self, manifest: &Manifest) -> Result<(), CacheError> {
-        let path = self.path_for(manifest.depot_id, manifest.manifest_id);
+    pub fn save(&self, app_id: u32, manifest: &Manifest) -> Result<(), CacheError> {
+        let path = self.path_for(app_id, manifest.depot_id, manifest.manifest_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CacheError::io("creating", parent, e))?;
         }
@@ -98,6 +110,7 @@ impl ManifestCache {
         std::fs::write(&tmp, &bytes).map_err(|e| CacheError::io("writing", &tmp, e))?;
         std::fs::rename(&tmp, &path).map_err(|e| CacheError::io("renaming to", &path, e))?;
         tracing::info!(
+            app_id,
             depot_id = manifest.depot_id,
             manifest_id = manifest.manifest_id,
             bytes = bytes.len(),
@@ -109,6 +122,7 @@ impl ManifestCache {
     /// Convenience: load from cache, or fall back to `fetch()` and persist.
     pub async fn get_or_fetch<F, Fut, E>(
         &self,
+        app_id: u32,
         depot_id: u32,
         manifest_id: u64,
         fetch: F,
@@ -118,11 +132,11 @@ impl ManifestCache {
         Fut: Future<Output = Result<Manifest, E>>,
         E: From<CacheError>,
     {
-        if let Some(m) = self.load_async(depot_id, manifest_id).await? {
+        if let Some(m) = self.load_async(app_id, depot_id, manifest_id).await? {
             return Ok(m);
         }
         let manifest = fetch().await?;
-        self.save(&manifest)?;
+        self.save(app_id, &manifest)?;
         Ok(manifest)
     }
 }
