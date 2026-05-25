@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -53,14 +52,12 @@ impl Auth {
 }
 
 impl SteamAuth for Auth {
-    fn resolve(&self) -> impl Future<Output = Result<SteamSession, VfsError>> + Send {
-        async move {
-            self.inner
-                .get_or_try_init(|| authenticate(&self.account, &self.password))
-                .await
-                .cloned()
-                .map_err(|e: anyhow::Error| VfsError::Other(e.to_string().into()))
-        }
+    async fn resolve(&self) -> Result<SteamSession, VfsError> {
+        self.inner
+            .get_or_try_init(|| authenticate(&self.account, &self.password))
+            .await
+            .cloned()
+            .map_err(|e: anyhow::Error| VfsError::Other(e.to_string().into()))
     }
 }
 

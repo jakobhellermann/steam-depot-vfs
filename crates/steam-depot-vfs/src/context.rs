@@ -1,17 +1,16 @@
 // TODO(ai-review): review for correctness/style
 //! High-level entry point that wires up auth, manifest cache, and chunk cache.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use steam_vent_depot::{ChunkHash, DepotKey};
-use tokio::sync::OnceCell;
+use steam_vent_depot::{ChunkHash, Manifest};
 
 use crate::auth::SteamAuth;
 use crate::chunk_store::{CdnChunkStore, FsCacheStore};
+use crate::depot_key_cache::{DepotKeyMemoryCache, LazyDepotKey};
 use crate::error::Result;
-use crate::fs::DepotSnapshot;
+use crate::fs::DepotManifestStore;
 use crate::manifest_cache::ManifestCache;
 
 /// Cache root that ties manifests and chunks to a single directory.
@@ -27,12 +26,7 @@ use crate::manifest_cache::ManifestCache;
 pub struct DepotStore {
     root: PathBuf,
     manifests: ManifestCache,
-    /// In-process depot key cache, keyed by `(app_id, depot_id)`. The
-    /// stored `OnceCell` is empty until something actually needs the
-    /// key — handed out to [`CdnChunkStore`]s so the cache stays
-    /// coherent if multiple stores point at the same depot.
-    /// Persisting these across restarts is future work.
-    depot_keys: Mutex<HashMap<(u32, u32), Arc<OnceCell<DepotKey>>>>,
+    depot_keys: DepotKeyMemoryCache,
 }
 
 impl DepotStore {
@@ -41,7 +35,7 @@ impl DepotStore {
         Self {
             root,
             manifests,
-            depot_keys: Mutex::new(HashMap::new()),
+            depot_keys: DepotKeyMemoryCache::new(),
         }
     }
 
@@ -55,40 +49,47 @@ impl DepotStore {
         depot_id: u32,
         manifest_gid: u64,
         branch: &str,
-    ) -> Result<DepotSnapshot<FsCacheStore<CdnChunkStore<A>>>> {
-        let depot_key_cell = self.depot_key_cell(app_id, depot_id);
+    ) -> Result<DepotManifestStore<FsCacheStore<CdnChunkStore<A>>>> {
+        let depot_key = self.depot_keys.get_lazy(app_id, depot_id);
         let manifest = self
-            .manifests
-            .get_or_fetch(depot_id, manifest_gid, || async {
-                let ctx = auth.resolve().await?;
-                let depot_key = depot_key_cell
-                    .get_or_try_init(|| async {
-                        tracing::info!(app_id, depot_id, "fetching depot key");
-                        Ok::<_, crate::VfsError>(ctx.client.depot_key(app_id, depot_id).await?)
-                    })
-                    .await?;
-                tracing::info!(depot_id, manifest_gid, branch, "fetching manifest");
-                let code = ctx
-                    .client
-                    .manifest_request_code(app_id, depot_id, manifest_gid, branch)
-                    .await?;
-                let m = ctx
-                    .client
-                    .fetch_manifest(&ctx.cdn_servers, depot_id, manifest_gid, code, depot_key)
-                    .await?;
-                Ok::<_, crate::VfsError>(m)
-            })
+            .get_manifest(&auth, app_id, depot_id, manifest_gid, branch, &depot_key)
             .await?;
         let manifest = Arc::new(manifest);
-        let cdn_store = CdnChunkStore::new(
-            Arc::clone(&auth),
-            app_id,
-            depot_id,
-            Arc::clone(&depot_key_cell),
-            &manifest,
-        );
+        let cdn_store = CdnChunkStore::new(Arc::clone(&auth), depot_id, depot_key, &manifest);
         let chunks = FsCacheStore::new(cdn_store, self.root.join("chunks"));
-        Ok(DepotSnapshot::new(manifest, chunks))
+        Ok(DepotManifestStore::new(manifest, chunks))
+    }
+
+    async fn get_manifest<A: SteamAuth + 'static>(
+        &self,
+        auth: &Arc<A>,
+        app_id: u32,
+        depot_id: u32,
+        manifest_gid: u64,
+        branch: &str,
+        depot_key: &LazyDepotKey,
+    ) -> Result<Manifest, crate::VfsError> {
+        let manifest = self
+            .manifests
+            .get_or_fetch(depot_id, manifest_gid, async move || -> Result<_> {
+                let depot_key = depot_key.get(&**auth).await?;
+                let ctx = auth.resolve().await?;
+                tracing::info!(depot_id, manifest_gid, branch, "fetching manifest");
+                let m = ctx
+                    .client
+                    .fetch_manifest(
+                        &ctx.cdn_servers,
+                        app_id,
+                        depot_id,
+                        manifest_gid,
+                        branch,
+                        depot_key,
+                    )
+                    .await?;
+                Ok(m)
+            })
+            .await?;
+        Ok(manifest)
     }
 
     /// Load a manifest from the on-disk cache without touching Steam.
@@ -167,16 +168,5 @@ impl DepotStore {
             }
         }
         Ok(out)
-    }
-
-    /// Get-or-create the shared [`OnceCell`] for a depot's key. The
-    /// cell itself is empty until something actually awaits on it.
-    fn depot_key_cell(&self, app_id: u32, depot_id: u32) -> Arc<OnceCell<DepotKey>> {
-        self.depot_keys
-            .lock()
-            .expect("depot_keys mutex poisoned")
-            .entry((app_id, depot_id))
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
     }
 }

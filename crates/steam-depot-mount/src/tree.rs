@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use fuser::INodeNo;
 use steam_depot_vfs::chunk_store::ChunkStore;
-use steam_depot_vfs::fs::DepotSnapshot;
+use steam_depot_vfs::fs::DepotManifestStore;
 
 use crate::inode::{self, SYNTHETIC};
 
@@ -54,7 +54,7 @@ pub(crate) struct SnapshotEntry<C: ChunkStore> {
     pub app_id: u32,
     pub depot_id: u32,
     pub manifest_gid: u64,
-    pub snapshot: DepotSnapshot<C>,
+    pub snapshot: DepotManifestStore<C>,
 }
 
 impl<C: ChunkStore> MountTree<C> {
@@ -88,7 +88,7 @@ impl<C: ChunkStore> MountTree<C> {
         app_id: u32,
         depot_id: u32,
         manifest_gid: u64,
-        snapshot: DepotSnapshot<C>,
+        snapshot: DepotManifestStore<C>,
     ) -> Result<SnapshotId, AddError> {
         let app_dir = self.ensure_synthetic(inode::ROOT, app_id.to_string());
         let depot_dir = self.ensure_synthetic(app_dir, depot_id.to_string());

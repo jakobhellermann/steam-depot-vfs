@@ -34,6 +34,7 @@
 mod auth;
 pub mod chunk_store;
 mod context;
+mod depot_key_cache;
 mod error;
 pub mod fs;
 mod manifest_cache;

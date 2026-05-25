@@ -9,7 +9,7 @@ use std::sync::Arc;
 use fuser::{BackgroundSession, MountOption};
 use parking_lot::RwLock;
 use steam_depot_vfs::chunk_store::ChunkStore;
-use steam_depot_vfs::fs::DepotSnapshot;
+use steam_depot_vfs::fs::DepotManifestStore;
 use tokio::runtime::Handle;
 
 use crate::fuse::FuseFs;
@@ -75,7 +75,7 @@ impl<C: ChunkStore + 'static> Mount<C> {
         app_id: u32,
         depot_id: u32,
         manifest_gid: u64,
-        snapshot: DepotSnapshot<C>,
+        snapshot: DepotManifestStore<C>,
     ) -> Result<SnapshotId, AddError> {
         self.tree
             .write()

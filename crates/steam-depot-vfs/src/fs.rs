@@ -27,11 +27,14 @@ pub struct Entry {
     pub meta: FileMeta,
 }
 
+#[deprecated = "Renamed to ManifestContents"]
+pub type DepotSnapshot<C> = DepotManifestStore<C>;
+
 /// File-system-style view over a single depot manifest.
 ///
 /// Created via [`crate::DepotStore::open_depot_manifest`] (recommended) or directly with
 /// [`DepotSnapshot::new`] if you want to bring your own chunk store.
-pub struct DepotSnapshot<C: ChunkStore> {
+pub struct DepotManifestStore<C: ChunkStore> {
     manifest: Arc<Manifest>,
     /// path -> index into `manifest.files`.
     by_path: HashMap<String, usize>,
@@ -40,7 +43,7 @@ pub struct DepotSnapshot<C: ChunkStore> {
     chunks: C,
 }
 
-impl<C: ChunkStore> DepotSnapshot<C> {
+impl<C: ChunkStore> DepotManifestStore<C> {
     pub fn new(manifest: Arc<Manifest>, chunks: C) -> Self {
         let mut by_path = HashMap::with_capacity(manifest.files.len());
         let mut children: HashMap<String, Vec<usize>> = HashMap::new();

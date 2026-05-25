@@ -24,7 +24,12 @@ pub struct SteamSession {
 }
 
 /// Source of a [`SteamSession`]. Implementations typically cache the
-/// resolved state internally so repeated calls are O(1) after the first.
+/// resolved state internally so repeated calls are cheap after the first.
 pub trait SteamAuth: Send + Sync {
     fn resolve(&self) -> impl Future<Output = Result<SteamSession>> + Send;
+}
+impl<A: SteamAuth> SteamAuth for &A {
+    fn resolve(&self) -> impl Future<Output = Result<SteamSession>> + Send {
+        (**self).resolve()
+    }
 }

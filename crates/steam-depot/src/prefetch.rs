@@ -157,7 +157,7 @@ fn parse_sha(s: &str) -> Option<ChunkHash> {
 }
 
 async fn prefetch_snapshot<C>(
-    snapshot: Arc<steam_depot_vfs::fs::DepotSnapshot<C>>,
+    snapshot: Arc<steam_depot_vfs::fs::DepotManifestStore<C>>,
     already_cached: &HashSet<ChunkHash>,
     parallelism: usize,
     max_duration: Option<std::time::Duration>,

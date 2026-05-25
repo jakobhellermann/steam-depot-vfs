@@ -43,7 +43,7 @@ enum Cmd {
     Mount {
         /// Write a Perfetto trace of every FUSE op and chunk fetch.
         /// Bare `--timings` writes to `./trace.pftrace`; pass a path to
-        /// override. Open the result at https://ui.perfetto.dev .
+        /// override. Open the result at <https://ui.perfetto.dev> .
         #[arg(
             long,
             value_name = "FILE",

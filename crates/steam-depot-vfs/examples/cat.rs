@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use steam_depot_vfs::{
     DepotStore, FileKind, SteamAuth, SteamSession, VfsError, chunk_store::ChunkStore,
-    fs::DepotSnapshot,
+    fs::DepotManifestStore,
 };
 use steam_vent::Connection;
 use steam_vent_depot::{CdnServer, DepotClient};
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn ls(fs: &DepotSnapshot<impl ChunkStore>, path: &str) -> Result<()> {
+fn ls(fs: &DepotManifestStore<impl ChunkStore>, path: &str) -> Result<()> {
     let mut entries = fs.list_dir(path)?;
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     for e in entries {
@@ -115,7 +115,7 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-async fn cat(fs: &DepotSnapshot<impl ChunkStore>, path: &str) -> Result<()> {
+async fn cat(fs: &DepotManifestStore<impl ChunkStore>, path: &str) -> Result<()> {
     let bytes = fs.read_full(path).await?;
     std::io::stdout().write_all(&bytes)?;
     Ok(())

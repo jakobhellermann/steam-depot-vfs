@@ -42,6 +42,7 @@ impl CacheError {
     }
 }
 
+#[derive(Clone)]
 pub struct ManifestCache {
     root: PathBuf,
 }
@@ -72,6 +73,18 @@ impl ManifestCache {
             "manifest cache hit"
         );
         Ok(Some(cached.into()))
+    }
+
+    /// decode and end up serialized.
+    pub async fn load_async(
+        &self,
+        depot_id: u32,
+        manifest_id: u64,
+    ) -> Result<Option<Manifest>, CacheError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.load(depot_id, manifest_id))
+            .await
+            .expect("manifest cache load task panicked")
     }
 
     pub fn save(&self, manifest: &Manifest) -> Result<(), CacheError> {
@@ -105,7 +118,7 @@ impl ManifestCache {
         Fut: Future<Output = Result<Manifest, E>>,
         E: From<CacheError>,
     {
-        if let Some(m) = self.load(depot_id, manifest_id)? {
+        if let Some(m) = self.load_async(depot_id, manifest_id).await? {
             return Ok(m);
         }
         let manifest = fetch().await?;
