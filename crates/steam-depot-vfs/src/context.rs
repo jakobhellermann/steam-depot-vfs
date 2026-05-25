@@ -117,7 +117,9 @@ impl DepotStore {
     /// Enumerate every chunk currently stored on disk. Stray files whose
     /// names don't parse as a hex chunk hash are silently skipped. Returns
     /// an empty iterator if the chunks dir doesn't exist yet.
-    pub fn list_chunks(&self) -> std::io::Result<impl Iterator<Item = std::io::Result<ChunkHash>>> {
+    pub fn list_chunks(
+        &self,
+    ) -> Result<impl Iterator<Item = Result<ChunkHash, std::io::Error>>, std::io::Error> {
         let dir = self.chunks_root();
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => Some(e),
@@ -137,7 +139,7 @@ impl DepotStore {
     /// Enumerate every cached manifest as `(depot_id, manifest_gid)` pairs.
     /// Stray files / directories with non-numeric names are silently
     /// skipped. Returns an empty vec if the manifests dir doesn't exist yet.
-    pub fn list_manifests(&self) -> std::io::Result<Vec<(u32, u64)>> {
+    pub fn list_manifests(&self) -> Result<Vec<(u32, u64)>, std::io::Error> {
         let root = self.manifests_root();
         let depot_entries = match std::fs::read_dir(&root) {
             Ok(e) => e,

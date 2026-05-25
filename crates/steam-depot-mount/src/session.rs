@@ -2,7 +2,8 @@
 //! Mount lifecycle: the FUSE session, signal handling, and the public
 //! [`Mount`] handle.
 
-use std::io;
+use std::future::Future;
+use std::io::Error as IoError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use steam_depot_vfs::fs::DepotManifestStore;
 use tokio::runtime::Handle;
 
 use crate::fuse::FuseFs;
-use crate::tree::{AddError, MountTree, SnapshotId};
+use crate::tree::{AddError, MountTree, Opener, OpenerFuture, SnapshotId};
 
 /// Configuration for [`Mount::start`].
 pub struct MountConfig {
@@ -67,9 +68,9 @@ impl<C: ChunkStore + 'static> Mount<C> {
         Ok(Self { bg, tree })
     }
 
-    /// Add `snapshot` under `/<app_id>/<depot_id>/<manifest_gid>`.
-    /// Visible immediately; the kernel will pick it up on the next
-    /// `lookup` against that path.
+    /// Add an already-loaded `snapshot` under
+    /// `/<app_id>/<depot_id>/<manifest_gid>`. Visible immediately; the
+    /// kernel picks it up on the next `lookup` against that path.
     pub fn add(
         &self,
         app_id: u32,
@@ -82,6 +83,28 @@ impl<C: ChunkStore + 'static> Mount<C> {
             .add(app_id, depot_id, manifest_gid, snapshot)
     }
 
+    /// Register a manifest under `/<app_id>/<depot_id>/<manifest_gid>`
+    /// without loading it. The first FUSE op that needs the contents
+    /// runs `opener`; concurrent first-ops coalesce on a single call.
+    /// Useful for mounting *every* known manifest up front when only a
+    /// few will actually be opened.
+    pub fn add_lazy<F, Fut>(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_gid: u64,
+        opener: F,
+    ) -> Result<SnapshotId, AddError>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<DepotManifestStore<C>, std::io::Error>> + Send + 'static,
+    {
+        let opener: Opener<C> = Arc::new(move || -> OpenerFuture<C> { Box::pin(opener()) });
+        self.tree
+            .write()
+            .add_lazy(app_id, depot_id, manifest_gid, opener)
+    }
+
     /// Detach a snapshot from the mount. New lookups against its
     /// subtree return `ENOENT`. In-flight reads against the snapshot
     /// (via cloned `Arc`s) finish normally.
@@ -91,20 +114,20 @@ impl<C: ChunkStore + 'static> Mount<C> {
 
     /// Block until SIGINT (Ctrl-C) or SIGTERM is received, then
     /// unmount cleanly and join the FUSE thread.
-    pub async fn wait_for_signal(self) -> io::Result<()> {
+    pub async fn wait_for_signal(self) -> Result<(), IoError> {
         wait_for_term_signal().await?;
         tracing::info!("signal received, unmounting");
         self.bg.umount_and_join()
     }
 
     /// Unmount immediately and join the FUSE thread.
-    pub fn unmount(self) -> io::Result<()> {
+    pub fn unmount(self) -> Result<(), IoError> {
         self.bg.umount_and_join()
     }
 }
 
 /// Wait for SIGINT or SIGTERM, whichever comes first.
-async fn wait_for_term_signal() -> io::Result<()> {
+async fn wait_for_term_signal() -> Result<(), IoError> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate())?;
     tokio::select! {
@@ -116,5 +139,5 @@ async fn wait_for_term_signal() -> io::Result<()> {
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
     #[error("FUSE error: {0}")]
-    Fuse(#[source] io::Error),
+    Fuse(#[source] IoError),
 }

@@ -11,13 +11,15 @@ mod verify;
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
 use steam_depot_mount::{Mount, MountConfig};
 #[cfg(target_os = "linux")]
 use steam_depot_vfs::DepotStore;
+#[cfg(target_os = "linux")]
+use steam_depot_vfs::chunk_store::{CdnChunkStore, FsCacheStore};
 use tracing_indicatif::IndicatifLayer;
 use tracing_perfetto::PerfettoLayer;
 use tracing_subscriber::{EnvFilter, prelude::*};
@@ -186,7 +188,10 @@ fn mount(cfg: Config) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let mount = Mount::start(
+    // The mount is generic over the chunk store; pin the type so
+    // `add_lazy` can be called before any manifest has been opened
+    // (which would otherwise be the spot that infers `C`).
+    let mount: Mount<FsCacheStore<CdnChunkStore<Auth>>> = Mount::start(
         MountConfig::new(cfg.mountpoint.clone()),
         rt.handle().clone(),
     )?;
@@ -194,20 +199,36 @@ fn mount(cfg: Config) -> anyhow::Result<()> {
 
     rt.block_on(async {
         let auth = Auth::prepare(cfg.steam.account.clone(), cfg.steam.password.clone()).await?;
-        let store = DepotStore::new(cfg.store_root.clone());
+        let store = Arc::new(DepotStore::new(cfg.store_root.clone()));
 
-        for m in &cfg.manifests {
+        for m in cfg.manifests {
+            let store = Arc::clone(&store);
+            let auth = Arc::clone(&auth);
             tracing::info!(
-                app_id = m.app_id,
-                depot_id = m.depot_id,
-                gid = m.gid,
-                branch = m.branch,
-                "opening manifest",
+                m.app_id,
+                m.depot_id,
+                m.gid,
+                m.branch,
+                "registering manifest (lazy)"
             );
-            let snapshot = store
-                .open_depot_manifest(auth.clone(), m.app_id, m.depot_id, m.gid, &m.branch)
-                .await?;
-            mount.add(m.app_id, m.depot_id, m.gid, snapshot)?;
+            mount.add_lazy(m.app_id, m.depot_id, m.gid, move || {
+                let store = Arc::clone(&store);
+                let auth = Arc::clone(&auth);
+                let branch = m.branch.clone();
+                async move {
+                    tracing::info!(
+                        m.app_id,
+                        m.depot_id,
+                        m.gid,
+                        branch,
+                        "opening manifest on first access"
+                    );
+                    store
+                        .open_depot_manifest(auth, m.app_id, m.depot_id, m.gid, &branch)
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                }
+            })?;
         }
 
         mount.wait_for_signal().await?;

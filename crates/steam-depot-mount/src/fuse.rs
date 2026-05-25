@@ -19,7 +19,7 @@ use steam_depot_vfs::fs::Entry;
 use tokio::runtime::Handle;
 
 use crate::inode::{self, SYNTHETIC};
-use crate::tree::{MountTree, SnapshotEntry};
+use crate::tree::{LazyEntry, MountTree, SlotState, SnapshotEntry, SnapshotId};
 
 /// FUSE attribute TTL. Snapshots are immutable for their lifetime; on
 /// snapshot remove the kernel will see ENOENT only after this expires.
@@ -35,16 +35,96 @@ impl<C: ChunkStore + 'static> FuseFs<C> {
     pub fn new(tree: Arc<RwLock<MountTree<C>>>, rt: Handle) -> Self {
         Self { tree, rt }
     }
+
+    /// Look up `sid` in the tree.
+    fn slot_lookup(&self, sid: inode::SnapshotId) -> SlotLookup<C> {
+        let tree = self.tree.read();
+        let Some(slot) = tree.slot(sid) else {
+            return SlotLookup::Missing;
+        };
+        match &slot.state {
+            SlotState::Ready(entry) => SlotLookup::Ready(Arc::clone(entry)),
+            SlotState::Pending(lazy) => SlotLookup::Pending(Arc::clone(lazy)),
+        }
+    }
+
+    /// Drive a pending lazy opener (if not already done) and promote
+    /// the slot to `Ready`. Concurrent callers coalesce on the slot's
+    /// `OnceCell`.
+    async fn resolve(
+        tree: Arc<RwLock<MountTree<C>>>,
+        lazy: Arc<LazyEntry<C>>,
+        sid: SnapshotId,
+    ) -> Result<Arc<SnapshotEntry<C>>, String> {
+        let cell = Arc::clone(&lazy.cell);
+        let opener = Arc::clone(&lazy.opener);
+        let result = cell
+            .get_or_init(|| async move {
+                match (opener)().await {
+                    Ok(store) => Ok(Arc::new(SnapshotEntry { snapshot: store })),
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+            .await
+            .clone()?;
+        tree.write().promote(sid, Arc::clone(&result));
+        Ok(result)
+    }
+}
+
+/// Outcome of looking up a snapshot slot — three-way so callsites can
+/// branch on it without nested `Option`/`Result`.
+enum SlotLookup<C: ChunkStore> {
+    /// Slot is loaded; serve from `entry` directly.
+    Ready(Arc<SnapshotEntry<C>>),
+    /// Slot is registered but not yet opened. Drive the opener.
+    Pending(Arc<LazyEntry<C>>),
+    /// `sid` is out of bounds or the slot was removed. Reply ENOENT.
+    Missing,
 }
 
 impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let tree = self.tree.read();
         let Some(name) = name.to_str() else {
             reply.error(Errno::ENOENT);
             return;
         };
-        match resolve_child(&tree, parent, name) {
+        let (sid, _) = inode::unpack(parent);
+        if sid == SYNTHETIC {
+            // Synthetic dirs are fully described by the tree itself.
+            let tree = self.tree.read();
+            match resolve_synthetic_child(&tree, parent, name) {
+                Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+        // Inside a snapshot subtree — make sure it's resolved first.
+        let entry = match self.slot_lookup(sid) {
+            SlotLookup::Ready(e) => e,
+            SlotLookup::Pending(lazy) => {
+                let tree = Arc::clone(&self.tree);
+                let name = name.to_string();
+                self.rt.spawn(async move {
+                    match Self::resolve(tree, lazy, SnapshotId(sid)).await {
+                        Ok(entry) => match resolve_snapshot_child(&entry, parent, &name) {
+                            Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
+                            None => reply.error(Errno::ENOENT),
+                        },
+                        Err(e) => {
+                            tracing::warn!(%e, "lazy resolve failed during lookup");
+                            reply.error(Errno::EIO);
+                        }
+                    }
+                });
+                return;
+            }
+            SlotLookup::Missing => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+        match resolve_snapshot_child(&entry, parent, name) {
             Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
             None => reply.error(Errno::ENOENT),
         }
@@ -57,8 +137,47 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         _fh: Option<fuser::FileHandle>,
         reply: ReplyAttr,
     ) {
-        let tree = self.tree.read();
-        match attr_for(&tree, ino) {
+        let (sid, _) = inode::unpack(ino);
+        if sid == SYNTHETIC {
+            let tree = self.tree.read();
+            match attr_for_synthetic(&tree, ino) {
+                Some(attr) => reply.attr(&TTL, &attr),
+                None => reply.error(Errno::ENOENT),
+            }
+            return;
+        }
+        // Inside a snapshot. For idx==0 (the gid root) we can answer
+        // without resolving, since it's just "a directory" until we
+        // need actual file metadata.
+        let (_, idx) = inode::unpack(ino);
+        if idx == 0 {
+            reply.attr(&TTL, &dir_attr(ino, 0));
+            return;
+        }
+        let entry = match self.slot_lookup(sid) {
+            SlotLookup::Ready(e) => e,
+            SlotLookup::Pending(lazy) => {
+                let tree = Arc::clone(&self.tree);
+                self.rt.spawn(async move {
+                    match Self::resolve(tree, lazy, SnapshotId(sid)).await {
+                        Ok(entry) => match attr_within_snapshot(&entry, ino) {
+                            Some(attr) => reply.attr(&TTL, &attr),
+                            None => reply.error(Errno::ENOENT),
+                        },
+                        Err(e) => {
+                            tracing::warn!(%e, "lazy resolve failed during getattr");
+                            reply.error(Errno::EIO);
+                        }
+                    }
+                });
+                return;
+            }
+            SlotLookup::Missing => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+        match attr_within_snapshot(&entry, ino) {
             Some(attr) => reply.attr(&TTL, &attr),
             None => reply.error(Errno::ENOENT),
         }
@@ -70,41 +189,48 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         ino: INodeNo,
         _fh: fuser::FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
-        let entries = {
-            let tree = self.tree.read();
-            match collect_dir(&tree, ino) {
-                Some(e) => e,
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
+        let (sid, _) = inode::unpack(ino);
+        if sid == SYNTHETIC {
+            let entries = {
+                let tree = self.tree.read();
+                match collect_synthetic_dir(&tree, ino) {
+                    Some(e) => e,
+                    None => {
+                        reply.error(Errno::ENOENT);
+                        return;
+                    }
                 }
+            };
+            emit_readdir(ino, &entries, offset, reply);
+            return;
+        }
+        let entry = match self.slot_lookup(sid) {
+            SlotLookup::Ready(e) => e,
+            SlotLookup::Pending(lazy) => {
+                let tree = Arc::clone(&self.tree);
+                self.rt.spawn(async move {
+                    match Self::resolve(tree, lazy, SnapshotId(sid)).await {
+                        Ok(entry) => {
+                            let kids = collect_snapshot_dir(&entry, ino).unwrap_or_default();
+                            emit_readdir(ino, &kids, offset, reply);
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "lazy resolve failed during readdir");
+                            reply.error(Errno::EIO);
+                        }
+                    }
+                });
+                return;
+            }
+            SlotLookup::Missing => {
+                reply.error(Errno::ENOENT);
+                return;
             }
         };
-
-        // Cookie semantics: each entry is given a `next_offset` that
-        // the kernel echoes back so we can resume. Skip entries whose
-        // cookie is <= the offset the kernel already saw. `reply.add`
-        // returns true when the kernel's buffer is full — stop adding
-        // but still call `reply.ok()` so the kernel knows to come back
-        // (with a higher offset) instead of looping on the same one.
-        let mut all: Vec<(INodeNo, FileType, &str)> = Vec::with_capacity(entries.len() + 2);
-        all.push((ino, FileType::Directory, "."));
-        all.push((ino, FileType::Directory, ".."));
-        for (child_ino, kind, name) in &entries {
-            all.push((*child_ino, *kind, name.as_str()));
-        }
-        for (i, (child_ino, kind, name)) in all.iter().enumerate() {
-            let next_offset = (i + 1) as u64;
-            if next_offset <= offset {
-                continue;
-            }
-            if reply.add(*child_ino, next_offset, *kind, name) {
-                break;
-            }
-        }
-        reply.ok();
+        let kids = collect_snapshot_dir(&entry, ino).unwrap_or_default();
+        emit_readdir(ino, &kids, offset, reply);
     }
 
     fn read(
@@ -127,40 +253,42 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
             reply.error(Errno::EISDIR);
             return;
         };
-        // Clone the snapshot Arc out of the tree before going async so
-        // the CDN fetch doesn't block concurrent `add`/`remove`.
-        let entry = {
-            let tree = self.tree.read();
-            match tree.snapshot(sid) {
-                Some(e) => e.clone(),
+        let tree_arc = Arc::clone(&self.tree);
+        let initial = self.slot_lookup(sid);
+        self.rt.spawn(async move {
+            let entry = match initial {
+                SlotLookup::Ready(e) => e,
+                SlotLookup::Pending(lazy) => {
+                    match Self::resolve(tree_arc, lazy, SnapshotId(sid)).await {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(%e, "lazy resolve failed during read");
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                }
+                SlotLookup::Missing => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            };
+            let path = match entry.snapshot.manifest().files.get(file_idx) {
+                Some(file) => {
+                    if matches!(file.kind, FileKind::Symlink) {
+                        tracing::warn!(
+                            path = %file.path,
+                            target = ?file.linktarget,
+                            "reading symlink as regular file; link target not resolved",
+                        );
+                    }
+                    file.path.clone()
+                }
                 None => {
                     reply.error(Errno::ENOENT);
                     return;
                 }
-            }
-        };
-        let path = match entry.snapshot.manifest().files.get(file_idx) {
-            Some(file) => {
-                if matches!(file.kind, FileKind::Symlink) {
-                    tracing::warn!(
-                        path = %file.path,
-                        target = ?file.linktarget,
-                        "reading symlink as regular file; link target not resolved",
-                    );
-                }
-                file.path.clone()
-            }
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        // Drop into our shared runtime to run the async fetch + cache
-        // read. fuser's main loop is blocking, but each callback is
-        // allowed to return without sending a reply as long as
-        // *something* eventually does — so we hand the reply to the
-        // task and let it complete out-of-band.
-        self.rt.spawn(async move {
+            };
             let mut buf = Vec::with_capacity(size as usize);
             match entry
                 .snapshot
@@ -185,21 +313,62 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
     }
 }
 
-/// Resolve `(parent, name)` to `(child_ino, attr)`, walking synthetic
-/// dirs and snapshot interiors transparently.
-fn resolve_child<C: ChunkStore>(
+/// Push `entries` into a `ReplyDirectory`, including `.` and `..`.
+fn emit_readdir(
+    ino: INodeNo,
+    entries: &[(INodeNo, FileType, String)],
+    offset: u64,
+    mut reply: ReplyDirectory,
+) {
+    // Cookie semantics: each entry is given a `next_offset` that the
+    // kernel echoes back so we can resume. Skip entries whose cookie is
+    // <= the offset the kernel already saw. `reply.add` returns true
+    // when the buffer is full — stop adding but still call `reply.ok()`
+    // so the kernel knows to come back with a higher offset instead of
+    // looping on the same one.
+    let mut all: Vec<(INodeNo, FileType, &str)> = Vec::with_capacity(entries.len() + 2);
+    all.push((ino, FileType::Directory, "."));
+    all.push((ino, FileType::Directory, ".."));
+    for (child_ino, kind, name) in entries {
+        all.push((*child_ino, *kind, name.as_str()));
+    }
+    for (i, (child_ino, kind, name)) in all.iter().enumerate() {
+        let next_offset = (i + 1) as u64;
+        if next_offset <= offset {
+            continue;
+        }
+        if reply.add(*child_ino, next_offset, *kind, name) {
+            break;
+        }
+    }
+    reply.ok();
+}
+
+/// Resolve `(parent, name)` on a synthetic dir parent.
+fn resolve_synthetic_child<C: ChunkStore>(
     tree: &MountTree<C>,
     parent: INodeNo,
     name: &str,
 ) -> Option<(INodeNo, FileAttr)> {
+    let dir = tree.synthetic(parent)?;
+    let &child = dir.children.get(name)?;
+    let attr = attr_for_synthetic(tree, child).or_else(|| {
+        // Child lives inside a snapshot — only its idx==0 root makes
+        // sense to answer here (a synthetic parent's child is always
+        // either another synthetic dir or a snapshot root).
+        let (_, idx) = inode::unpack(child);
+        (idx == 0).then(|| dir_attr(child, 0))
+    })?;
+    Some((child, attr))
+}
+
+/// Resolve `(parent, name)` within a snapshot subtree.
+fn resolve_snapshot_child<C: ChunkStore>(
+    entry: &SnapshotEntry<C>,
+    parent: INodeNo,
+    name: &str,
+) -> Option<(INodeNo, FileAttr)> {
     let (sid, idx) = inode::unpack(parent);
-    if sid == SYNTHETIC {
-        let dir = tree.synthetic(parent)?;
-        let &child = dir.children.get(name)?;
-        let attr = attr_for(tree, child)?;
-        return Some((child, attr));
-    }
-    let entry = tree.snapshot(sid)?;
     let parent_path = snapshot_path_of(entry, idx)?;
     let child_path = if parent_path.is_empty() {
         name.to_string()
@@ -212,12 +381,17 @@ fn resolve_child<C: ChunkStore>(
     Some((child_ino, file_kind_attr(f.kind, child_ino, f.size)))
 }
 
-fn attr_for<C: ChunkStore>(tree: &MountTree<C>, ino: INodeNo) -> Option<FileAttr> {
-    let (sid, idx) = inode::unpack(ino);
-    if sid == SYNTHETIC {
-        return Some(dir_attr(ino, 0));
+fn attr_for_synthetic<C: ChunkStore>(tree: &MountTree<C>, ino: INodeNo) -> Option<FileAttr> {
+    let (sid, _) = inode::unpack(ino);
+    if sid != SYNTHETIC {
+        return None;
     }
-    let entry = tree.snapshot(sid)?;
+    tree.synthetic(ino)?;
+    Some(dir_attr(ino, 0))
+}
+
+fn attr_within_snapshot<C: ChunkStore>(entry: &SnapshotEntry<C>, ino: INodeNo) -> Option<FileAttr> {
+    let (_, idx) = inode::unpack(ino);
     if idx == 0 {
         return Some(dir_attr(ino, 0));
     }
@@ -242,25 +416,25 @@ fn snapshot_path_of<C: ChunkStore>(entry: &SnapshotEntry<C>, idx: u64) -> Option
     Some(entry.snapshot.manifest().files.get(file_idx)?.path.clone())
 }
 
-/// Gather direct children of `ino` as `(inode, type, name)` for readdir.
-fn collect_dir<C: ChunkStore>(
+fn collect_synthetic_dir<C: ChunkStore>(
     tree: &MountTree<C>,
     ino: INodeNo,
 ) -> Option<Vec<(INodeNo, FileType, String)>> {
+    let dir = tree.synthetic(ino)?;
+    let mut out: Vec<_> = dir
+        .children
+        .iter()
+        .map(|(name, &child_ino)| (child_ino, FileType::Directory, name.clone()))
+        .collect();
+    out.sort_by(|a, b| a.2.cmp(&b.2));
+    Some(out)
+}
+
+fn collect_snapshot_dir<C: ChunkStore>(
+    entry: &SnapshotEntry<C>,
+    ino: INodeNo,
+) -> Option<Vec<(INodeNo, FileType, String)>> {
     let (sid, idx) = inode::unpack(ino);
-    if sid == SYNTHETIC {
-        let dir = tree.synthetic(ino)?;
-        // Synthetic children are always directories: app-id dirs,
-        // depot-id dirs, or snapshot roots (which themselves are dirs).
-        let mut out: Vec<_> = dir
-            .children
-            .iter()
-            .map(|(name, &child_ino)| (child_ino, FileType::Directory, name.clone()))
-            .collect();
-        out.sort_by(|a, b| a.2.cmp(&b.2));
-        return Some(out);
-    }
-    let entry = tree.snapshot(sid)?;
     let dir_path = snapshot_path_of(entry, idx)?;
     let entries: Vec<Entry> = entry.snapshot.list_dir(&dir_path).ok()?;
     let mut out = Vec::with_capacity(entries.len());
