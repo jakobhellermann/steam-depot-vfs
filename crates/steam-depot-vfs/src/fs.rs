@@ -9,7 +9,6 @@ use bytes::Bytes;
 use steam_vent_depot::{DepotFile, FileKind, Manifest};
 
 use crate::chunk_store::ChunkStore;
-use crate::error::{Result, VfsError};
 
 /// Cheap metadata for a file/directory/symlink entry.
 #[derive(Debug, Clone)]
@@ -83,7 +82,7 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         self.by_path.get(strip_leading_slash(path)).copied()
     }
 
-    pub fn metadata(&self, path: &str) -> Result<FileMeta> {
+    pub fn metadata(&self, path: &str) -> Result<FileMeta, std::io::Error> {
         if path.is_empty() || path == "/" {
             return Ok(FileMeta {
                 size: 0,
@@ -92,10 +91,12 @@ impl<C: ChunkStore> DepotManifestStore<C> {
             });
         }
         let path = strip_leading_slash(path);
-        let idx = self
-            .by_path
-            .get(path)
-            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
+        let idx = self.by_path.get(path).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("'{}' not found in steam depot", path),
+            )
+        })?;
         let f = &self.manifest.files[*idx];
         Ok(FileMeta {
             size: f.size,
@@ -104,16 +105,18 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         })
     }
 
-    pub fn list_dir(&self, path: &str) -> Result<Vec<Entry>> {
+    pub fn list_dir(&self, path: &str) -> Result<Vec<Entry>, std::io::Error> {
         let key = if path.is_empty() || path == "/" {
             ""
         } else {
             strip_leading_slash(path)
         };
-        let idxs = self
-            .children
-            .get(key)
-            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
+        let idxs = self.children.get(key).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("'{}' not found in steam depot", path),
+            )
+        })?;
         let mut out = Vec::with_capacity(idxs.len());
         for &i in idxs {
             let f = &self.manifest.files[i];
@@ -134,17 +137,20 @@ impl<C: ChunkStore> DepotManifestStore<C> {
     }
 
     /// Read the entire file at `path`. Convenience wrapper around [`read`](Self::read).
-    pub async fn read_full(&self, path: &str) -> Result<Bytes> {
+    pub async fn read_full(&self, path: &str) -> Result<Bytes, std::io::Error> {
         let meta = self.metadata(path)?;
         if !matches!(meta.kind, FileKind::File) {
-            return Err(VfsError::NotAFile(path.into()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("'{}' is not a regular file", path),
+            ));
         }
         self.read(path, 0, meta.size).await
     }
 
     /// Read up to `len` bytes from `path` starting at `offset`. Returns fewer
     /// bytes than requested only at EOF.
-    pub async fn read(&self, path: &str, offset: u64, len: u64) -> Result<Bytes> {
+    pub async fn read(&self, path: &str, offset: u64, len: u64) -> Result<Bytes, std::io::Error> {
         let mut out = Vec::new();
         self.read_into(path, offset, len, &mut out).await?;
         Ok(Bytes::from(out))
@@ -162,21 +168,26 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         offset: u64,
         len: u64,
         out: &mut Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<(), std::io::Error> {
         let p = strip_leading_slash(path);
-        let idx = *self
-            .by_path
-            .get(p)
-            .ok_or_else(|| VfsError::NotFound(path.into()))?;
+        let idx = *self.by_path.get(p).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("'{}' not found in steam depot", path),
+            )
+        })?;
         let f: &DepotFile = &self.manifest.files[idx];
         if !matches!(f.kind, FileKind::File) {
-            return Err(VfsError::NotAFile(path.into()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("'{}' is not a regular file", path),
+            ));
         }
         if offset > f.size {
-            return Err(VfsError::OutOfRange {
-                size: f.size,
-                offset,
-            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("read past end of file (size={}, offset={})", f.size, offset),
+            ));
         }
         let end = (offset + len).min(f.size);
         let want_len = (end - offset) as usize;
@@ -203,7 +214,11 @@ impl<C: ChunkStore> DepotManifestStore<C> {
             if c_start >= end {
                 break;
             }
-            let bytes = self.chunks.get(c.sha).await?;
+            let bytes = self
+                .chunks
+                .get(c.sha)
+                .await
+                .map_err(std::io::Error::other)?;
             let slice_start = offset.saturating_sub(c_start) as usize;
             let slice_end = (end.min(c_end) - c_start) as usize;
             out.extend_from_slice(&bytes[slice_start..slice_end]);
