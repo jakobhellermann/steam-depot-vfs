@@ -38,6 +38,7 @@ mod depot_key_cache;
 mod error;
 pub mod fs;
 mod manifest_cache;
+pub mod session;
 
 pub use auth::{SteamAuth, SteamSession};
 pub use context::DepotStore;

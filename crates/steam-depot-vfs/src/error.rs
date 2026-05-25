@@ -19,6 +19,10 @@ pub enum VfsError {
     #[error(transparent)]
     Depot(#[from] steam_vent_depot::DepotError),
     #[error(transparent)]
+    ServerDiscoveryError(steam_vent::ServerDiscoveryError),
+    #[error(transparent)]
+    ConnectionError(steam_vent::ConnectionError),
+    #[error(transparent)]
     ManifestCache(#[from] crate::manifest_cache::CacheError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
