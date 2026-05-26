@@ -2,11 +2,13 @@
 //! Filesystem-shaped view over a single depot manifest.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use steam_vent_depot::{DepotFile, FileKind, Manifest};
+use tokio::runtime::Handle;
 
 use crate::chunk_store::ChunkStore;
 
@@ -258,6 +260,154 @@ impl<C: ChunkStore> DepotManifestStore<C> {
             out.extend_from_slice(&bytes[slice_start..slice_end]);
         }
         Ok(())
+    }
+}
+
+impl<C: ChunkStore> DepotManifestStore<C> {
+    /// Open a regular file as a synchronous [`Read`] + [`Seek`] handle.
+    ///
+    /// Chunk fetches happen via `handle.block_on(...)`, so this is meant for
+    /// sync callers that have a tokio runtime running on *another* thread
+    /// (calling `block_on` from inside an async task on the same runtime
+    /// will panic). Use [`read`](Self::read) / [`read_into`](Self::read_into)
+    /// from async code.
+    ///
+    /// The reader keeps the most-recently-touched chunk in memory, so
+    /// sequential reads within a single chunk don't re-fetch — and when the
+    /// chunk is already in the local cache, the `block_on` is effectively
+    /// free.
+    pub fn open_reader<'a>(
+        &'a self,
+        path: &str,
+        handle: Handle,
+    ) -> Result<DepotFileReader<'a, C>, std::io::Error> {
+        let stripped = strip_leading_slash(path);
+        let idx = *self
+            .by_path
+            .get(stripped)
+            .ok_or_else(|| self.not_found_error(path, stripped))?;
+        let f = &self.manifest.files[idx];
+        if !matches!(f.kind, FileKind::File) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("'{}' is not a regular file", path),
+            ));
+        }
+        debug_assert!(f.chunks.is_sorted_by_key(|c| c.offset));
+        Ok(DepotFileReader {
+            store: self,
+            file_idx: idx,
+            size: f.size,
+            pos: 0,
+            handle,
+            cached: None,
+        })
+    }
+}
+
+/// Synchronous [`Read`] + [`Seek`] handle over a single file in a depot
+/// manifest. Created by [`DepotManifestStore::open_reader`].
+///
+/// Chunks are fetched lazily on read. The reader caches the last chunk it
+/// touched so consecutive reads within the same chunk don't go back through
+/// the chunk store.
+// TODO: prefetch the next chunk via `ensure` on chunk boundary crossings —
+// only worth it when CDN roundtrips dominate; no-op for warm FS cache.
+pub struct DepotFileReader<'a, C: ChunkStore> {
+    store: &'a DepotManifestStore<C>,
+    file_idx: usize,
+    size: u64,
+    pos: u64,
+    handle: Handle,
+    /// Last chunk fetched, keyed by its index in `DepotFile::chunks`.
+    cached: Option<(usize, Bytes)>,
+}
+
+impl<'a, C: ChunkStore> DepotFileReader<'a, C> {
+    /// Total size of the file in bytes.
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Current read position.
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    fn file(&self) -> &DepotFile {
+        &self.store.manifest.files[self.file_idx]
+    }
+}
+
+impl<'a, C: ChunkStore> Read for DepotFileReader<'a, C> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.size {
+            return Ok(0);
+        }
+        let f = self.file();
+        // Chunks are sorted by offset and cover the file contiguously, so the
+        // chunk containing `self.pos` is the last one whose offset is <= pos.
+        let chunk_i = f
+            .chunks
+            .partition_point(|c| c.offset <= self.pos)
+            .checked_sub(1)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("no chunk covers offset {} in '{}'", self.pos, f.path),
+                )
+            })?;
+        let chunk = &f.chunks[chunk_i];
+        if self.pos >= chunk.offset + chunk.size_uncompressed as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("no chunk covers offset {} in '{}'", self.pos, f.path),
+            ));
+        }
+        let chunk_sha = chunk.sha;
+        let chunk_offset = chunk.offset;
+
+        let bytes = match &self.cached {
+            Some((i, b)) if *i == chunk_i => b.clone(),
+            _ => {
+                let store = self.store.chunks();
+                let fetched = self
+                    .handle
+                    .block_on(store.get(chunk_sha))
+                    .map_err(std::io::Error::other)?;
+                self.cached = Some((chunk_i, fetched.clone()));
+                fetched
+            }
+        };
+
+        let chunk_off = (self.pos - chunk_offset) as usize;
+        let available = bytes.len().saturating_sub(chunk_off);
+        let to_copy = available.min(buf.len());
+        buf[..to_copy].copy_from_slice(&bytes[chunk_off..chunk_off + to_copy]);
+        self.pos += to_copy as u64;
+        Ok(to_copy)
+    }
+}
+
+impl<'a, C: ChunkStore> Seek for DepotFileReader<'a, C> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos: i128 = match pos {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::End(n) => self.size as i128 + n as i128,
+            SeekFrom::Current(n) => self.pos as i128 + n as i128,
+        };
+        if new_pos < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start of file",
+            ));
+        }
+        self.pos = new_pos as u64;
+        Ok(self.pos)
     }
 }
 
