@@ -2644,6 +2644,7 @@ dependencies = [
 [[package]]
 name = "steam-vent-depot"
 version = "0.1.0"
+source = "git+https://github.com/jakobhellermann/steam-vent-depot#e691dc43374c130c903527ac2fd5bf5bdd2725eb"
 dependencies = [
  "aes 0.9.0",
  "base64",

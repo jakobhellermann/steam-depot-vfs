@@ -11,6 +11,7 @@ use super::ChunkStore;
 use crate::auth::SteamAuth;
 use crate::depot_key_cache::LazyDepotKey;
 use crate::error::{Result, VfsError};
+use crate::session::LazyCachedAuth;
 
 /// [`ChunkStore`] backed by Steam's CDN.
 ///
@@ -18,7 +19,7 @@ use crate::error::{Result, VfsError};
 /// `get()`. Constructing a `CdnChunkStore` doesn't touch the network —
 /// the manifest-cache hit path can build one and never resolve auth if
 /// no chunk is ever read.
-pub struct CdnChunkStore<A: SteamAuth> {
+pub struct CdnChunkStore<A: SteamAuth = LazyCachedAuth> {
     auth: Arc<A>,
     depot_id: u32,
     depot_key: LazyDepotKey,

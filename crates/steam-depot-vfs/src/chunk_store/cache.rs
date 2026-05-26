@@ -8,7 +8,7 @@ use steam_vent_depot::ChunkHash;
 use tokio::io::AsyncWriteExt;
 
 use super::ChunkStore;
-use crate::error::Result;
+use crate::{chunk_store::CdnChunkStore, error::Result};
 
 /// Write-through local-disk cache in front of another [`ChunkStore`].
 ///
@@ -17,7 +17,7 @@ use crate::error::Result;
 /// may both fetch — since chunks are content-addressed and writes are atomic
 /// (write-then-rename), this only wastes one redundant download, never
 /// corrupts the cache.
-pub struct FsCacheStore<Inner: ChunkStore> {
+pub struct FsCacheStore<Inner: ChunkStore = CdnChunkStore> {
     inner: Inner,
     root: PathBuf,
 }
