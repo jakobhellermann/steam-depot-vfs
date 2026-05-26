@@ -38,7 +38,7 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
 }
 
 impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
-    #[tracing::instrument(name = "fs_cache.get", skip_all)]
+    #[tracing::instrument(level = "debug", name = "fs_cache.get", skip_all)]
     async fn get(&self, sha: ChunkHash) -> Result<Bytes> {
         let path = self.path_for(sha);
         if let Ok(bytes) = tokio::fs::read(&path).await {
@@ -49,7 +49,7 @@ impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
         Ok(bytes)
     }
 
-    #[tracing::instrument(name = "fs_cache.ensure", skip_all)]
+    #[tracing::instrument(level = "debug", name = "fs_cache.ensure", skip_all)]
     async fn ensure(&self, sha: ChunkHash) -> Result<()> {
         let path = self.path_for(sha);
         // `try_exists` is the cheap check: a single `stat` rather than
@@ -69,7 +69,7 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
     /// Shared fetch-and-persist path used by both [`get`] and [`ensure`].
     /// Returns the fetched bytes; callers that don't need them (i.e.
     /// `ensure`) just discard.
-    #[tracing::instrument(name = "fs_cache.persist", skip(self, path), fields(%sha))]
+    #[tracing::instrument(level = "debug", name = "fs_cache.persist", skip(self, path), fields(%sha))]
     async fn fetch_and_persist(&self, sha: ChunkHash, path: &std::path::Path) -> Result<Bytes> {
         tracing::debug!(%sha, "cache miss, fetching from inner store");
         let bytes = self.inner.get(sha).await?;
@@ -87,7 +87,7 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
     /// a no-op anyway. In the rare power-loss case a committed chunk
     /// file can read back as zeros — the recovery path is "refetch",
     /// which is cheap for a content-addressed cache.
-    #[tracing::instrument(name = "fs_cache.write_atomic", skip(self, bytes), fields(bytes_len = bytes.len()))]
+    #[tracing::instrument(level = "debug", name = "fs_cache.write_atomic", skip(self, bytes), fields(bytes_len = bytes.len()))]
     async fn write_atomic(&self, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         let mut f = tokio::fs::File::create(&tmp).await?;

@@ -142,6 +142,7 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         })
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn list_dir(&self, path: &str) -> Result<Vec<Entry>, std::io::Error> {
         let key = if path.is_empty() || path == "/" {
             ""
