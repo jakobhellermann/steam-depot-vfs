@@ -82,6 +82,45 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         self.by_path.get(strip_leading_slash(path)).copied()
     }
 
+    /// Build a `NotFound` error that names the first path component that
+    /// does not exist in the manifest. `requested` is the full path the
+    /// caller asked about (kept verbatim in the message); `stripped` is the
+    /// same path with any leading `/` removed, which is what we use to walk
+    /// the index. Empty `stripped` means the synthetic root, which always
+    /// exists — in that case we just report the requested path.
+    fn not_found_error(&self, requested: &str, stripped: &str) -> std::io::Error {
+        let missing = self.first_missing_component(stripped);
+        let msg = match missing {
+            Some(component) => format!(
+                "'{}' not found in steam depot (missing component '{}')",
+                requested, component
+            ),
+            None => format!("'{}' not found in steam depot", requested),
+        };
+        std::io::Error::new(std::io::ErrorKind::NotFound, msg)
+    }
+
+    /// Walk `path` component by component and return the prefix at which the
+    /// walk first fails. A component is considered present if it is either a
+    /// file (key in `by_path`) or a directory (key in `children`).
+    fn first_missing_component<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if path.is_empty() {
+            return None;
+        }
+        let mut end = 0;
+        loop {
+            let next = path[end..].find('/').map(|i| end + i).unwrap_or(path.len());
+            let prefix = &path[..next];
+            if !self.by_path.contains_key(prefix) && !self.children.contains_key(prefix) {
+                return Some(prefix);
+            }
+            if next == path.len() {
+                return None;
+            }
+            end = next + 1;
+        }
+    }
+
     pub fn metadata(&self, path: &str) -> Result<FileMeta, std::io::Error> {
         if path.is_empty() || path == "/" {
             return Ok(FileMeta {
@@ -90,13 +129,11 @@ impl<C: ChunkStore> DepotManifestStore<C> {
                 linktarget: None,
             });
         }
-        let path = strip_leading_slash(path);
-        let idx = self.by_path.get(path).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("'{}' not found in steam depot", path),
-            )
-        })?;
+        let stripped = strip_leading_slash(path);
+        let idx = self
+            .by_path
+            .get(stripped)
+            .ok_or_else(|| self.not_found_error(path, stripped))?;
         let f = &self.manifest.files[*idx];
         Ok(FileMeta {
             size: f.size,
@@ -111,12 +148,10 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         } else {
             strip_leading_slash(path)
         };
-        let idxs = self.children.get(key).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("'{}' not found in steam depot", path),
-            )
-        })?;
+        let idxs = self
+            .children
+            .get(key)
+            .ok_or_else(|| self.not_found_error(path, key))?;
         let mut out = Vec::with_capacity(idxs.len());
         for &i in idxs {
             let f = &self.manifest.files[i];
@@ -170,12 +205,10 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         out: &mut Vec<u8>,
     ) -> Result<(), std::io::Error> {
         let p = strip_leading_slash(path);
-        let idx = *self.by_path.get(p).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("'{}' not found in steam depot", path),
-            )
-        })?;
+        let idx = *self
+            .by_path
+            .get(p)
+            .ok_or_else(|| self.not_found_error(path, p))?;
         let f: &DepotFile = &self.manifest.files[idx];
         if !matches!(f.kind, FileKind::File) {
             return Err(std::io::Error::new(
