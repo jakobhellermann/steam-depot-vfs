@@ -6,7 +6,7 @@
 
 use std::ffi::OsStr;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     Errno, FileAttr, FileType, Filesystem, Generation, INodeNo, OpenFlags, ReplyAttr, ReplyData,
@@ -151,7 +151,18 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         // need actual file metadata.
         let (_, idx) = inode::unpack(ino);
         if idx == 0 {
-            reply.attr(&TTL, &dir_attr(ino, 0));
+            // Snapshot root: answer without resolving so we don't force a
+            // manifest fetch just for getattr. mtime falls back to EPOCH
+            // until the slot has a cached `creation_time` (set on eager
+            // add and on lazy promote).
+            let mtime = self
+                .tree
+                .read()
+                .slot(sid)
+                .and_then(|s| s.creation_time)
+                .map(manifest_mtime)
+                .unwrap_or(UNIX_EPOCH);
+            reply.attr(&TTL, &dir_attr(ino, 0, mtime));
             return;
         }
         let entry = match self.slot_lookup(sid) {
@@ -355,9 +366,18 @@ fn resolve_synthetic_child<C: ChunkStore>(
     let attr = attr_for_synthetic(tree, child).or_else(|| {
         // Child lives inside a snapshot — only its idx==0 root makes
         // sense to answer here (a synthetic parent's child is always
-        // either another synthetic dir or a snapshot root).
-        let (_, idx) = inode::unpack(child);
-        (idx == 0).then(|| dir_attr(child, 0))
+        // either another synthetic dir or a snapshot root). Use the
+        // slot's cached creation_time if available, EPOCH otherwise.
+        let (sid, idx) = inode::unpack(child);
+        if idx != 0 {
+            return None;
+        }
+        let mtime = tree
+            .slot(sid)
+            .and_then(|s| s.creation_time)
+            .map(manifest_mtime)
+            .unwrap_or(UNIX_EPOCH);
+        Some(dir_attr(child, 0, mtime))
     })?;
     Some((child, attr))
 }
@@ -377,8 +397,10 @@ fn resolve_snapshot_child<C: ChunkStore>(
     };
     let child_idx = entry.snapshot.index_of(&child_path)?;
     let child_ino = inode::pack(sid, (child_idx + 1) as u64);
-    let f = entry.snapshot.manifest().files.get(child_idx)?;
-    Some((child_ino, file_kind_attr(f.kind, child_ino, f.size)))
+    let manifest = entry.snapshot.manifest();
+    let f = manifest.files.get(child_idx)?;
+    let mtime = manifest_mtime(manifest.creation_time);
+    Some((child_ino, file_kind_attr(f.kind, child_ino, f.size, mtime)))
 }
 
 fn attr_for_synthetic<C: ChunkStore>(tree: &MountTree<C>, ino: INodeNo) -> Option<FileAttr> {
@@ -387,22 +409,24 @@ fn attr_for_synthetic<C: ChunkStore>(tree: &MountTree<C>, ino: INodeNo) -> Optio
         return None;
     }
     tree.synthetic(ino)?;
-    Some(dir_attr(ino, 0))
+    Some(dir_attr(ino, 0, UNIX_EPOCH))
 }
 
 fn attr_within_snapshot<C: ChunkStore>(entry: &SnapshotEntry<C>, ino: INodeNo) -> Option<FileAttr> {
     let (_, idx) = inode::unpack(ino);
+    let manifest = entry.snapshot.manifest();
+    let mtime = manifest_mtime(manifest.creation_time);
     if idx == 0 {
-        return Some(dir_attr(ino, 0));
+        return Some(dir_attr(ino, 0, mtime));
     }
-    let f = entry.snapshot.manifest().files.get(idx as usize - 1)?;
-    Some(file_kind_attr(f.kind, ino, f.size))
+    let f = manifest.files.get(idx as usize - 1)?;
+    Some(file_kind_attr(f.kind, ino, f.size, mtime))
 }
 
-fn file_kind_attr(kind: FileKind, ino: INodeNo, size: u64) -> FileAttr {
+fn file_kind_attr(kind: FileKind, ino: INodeNo, size: u64, mtime: SystemTime) -> FileAttr {
     match kind {
-        FileKind::Directory => dir_attr(ino, size),
-        FileKind::File | FileKind::Symlink => file_attr(ino, size),
+        FileKind::Directory => dir_attr(ino, size, mtime),
+        FileKind::File | FileKind::Symlink => file_attr(ino, size, mtime),
     }
 }
 
@@ -457,15 +481,22 @@ fn collect_snapshot_dir<C: ChunkStore>(
     Some(out)
 }
 
-fn dir_attr(ino: INodeNo, size: u64) -> FileAttr {
-    base_attr(ino, size, FileType::Directory, 0o555, 2)
+fn dir_attr(ino: INodeNo, size: u64, mtime: SystemTime) -> FileAttr {
+    base_attr(ino, size, FileType::Directory, 0o555, 2, mtime)
 }
 
-fn file_attr(ino: INodeNo, size: u64) -> FileAttr {
-    base_attr(ino, size, FileType::RegularFile, 0o444, 1)
+fn file_attr(ino: INodeNo, size: u64, mtime: SystemTime) -> FileAttr {
+    base_attr(ino, size, FileType::RegularFile, 0o444, 1, mtime)
 }
 
-fn base_attr(ino: INodeNo, size: u64, kind: FileType, perm: u16, nlink: u32) -> FileAttr {
+fn base_attr(
+    ino: INodeNo,
+    size: u64,
+    kind: FileType,
+    perm: u16,
+    nlink: u32,
+    mtime: SystemTime,
+) -> FileAttr {
     FileAttr {
         ino,
         size,
@@ -474,10 +505,10 @@ fn base_attr(ino: INodeNo, size: u64, kind: FileType, perm: u16, nlink: u32) -> 
         } else {
             0
         },
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
-        ctime: UNIX_EPOCH,
-        crtime: UNIX_EPOCH,
+        atime: mtime,
+        mtime,
+        ctime: mtime,
+        crtime: mtime,
         kind,
         perm,
         nlink,
@@ -487,4 +518,9 @@ fn base_attr(ino: INodeNo, size: u64, kind: FileType, perm: u16, nlink: u32) -> 
         blksize: 4096,
         flags: 0,
     }
+}
+
+/// Convert a manifest's `creation_time` (Unix seconds) into a `SystemTime`.
+fn manifest_mtime(creation_time: u32) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(u64::from(creation_time))
 }

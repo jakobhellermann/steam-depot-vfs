@@ -53,6 +53,11 @@ pub(crate) struct Slot<C: ChunkStore> {
     pub depot_id: u32,
     pub manifest_gid: u64,
     pub state: SlotState<C>,
+    /// Manifest `creation_time` (Unix seconds). `None` until the snapshot
+    /// is resolved — lets `getattr` on the `<gid>` root answer without
+    /// forcing a resolve, while still reporting the real release date
+    /// once available.
+    pub creation_time: Option<u32>,
 }
 
 pub(crate) struct MountTree<C: ChunkStore> {
@@ -123,9 +128,13 @@ impl<C: ChunkStore> MountTree<C> {
         manifest_gid: u64,
         snapshot: DepotManifestStore<C>,
     ) -> Result<SnapshotId, AddError> {
-        let id = self.reserve_slot(app_id, depot_id, manifest_gid, |entry| {
-            SlotState::Ready(Arc::new(entry(snapshot)))
-        })?;
+        let id = self.reserve_slot(
+            app_id,
+            depot_id,
+            manifest_gid,
+            |entry| SlotState::Ready(Arc::new(entry(snapshot))),
+            None,
+        )?;
         Ok(id)
     }
 
@@ -140,12 +149,19 @@ impl<C: ChunkStore> MountTree<C> {
         depot_id: u32,
         manifest_gid: u64,
         opener: Opener<C>,
+        creation_time: Option<u32>,
     ) -> Result<SnapshotId, AddError> {
         let lazy = Arc::new(LazyEntry {
             opener,
             cell: Arc::new(OnceCell::new()),
         });
-        self.reserve_slot(app_id, depot_id, manifest_gid, |_| SlotState::Pending(lazy))
+        self.reserve_slot(
+            app_id,
+            depot_id,
+            manifest_gid,
+            |_| SlotState::Pending(lazy),
+            creation_time,
+        )
     }
 
     /// Common path for [`add`] and [`add_lazy`]: ensures the synthetic
@@ -153,12 +169,16 @@ impl<C: ChunkStore> MountTree<C> {
     /// receives a constructor for `SnapshotEntry` (used only by the
     /// eager `add`) — keeping it in a closure means lazy registrations
     /// don't have to materialise a snapshot they don't have yet.
+    /// `creation_time_hint` lets lazy registrations preseed the slot's
+    /// mtime from e.g. a cached manifest, so `<gid>` getattr returns
+    /// the real release date even before the manifest is opened.
     fn reserve_slot(
         &mut self,
         app_id: u32,
         depot_id: u32,
         manifest_gid: u64,
         build: impl FnOnce(&dyn Fn(DepotManifestStore<C>) -> SnapshotEntry<C>) -> SlotState<C>,
+        creation_time_hint: Option<u32>,
     ) -> Result<SnapshotId, AddError> {
         let app_dir = self.ensure_synthetic(inode::ROOT, app_id.to_string());
         let depot_dir = self.ensure_synthetic(app_dir, depot_id.to_string());
@@ -182,11 +202,16 @@ impl<C: ChunkStore> MountTree<C> {
         let id = inode::SnapshotId::try_from(next_id).unwrap();
         let make_entry = |snapshot: DepotManifestStore<C>| SnapshotEntry { snapshot };
         let state = build(&make_entry);
+        let creation_time = match &state {
+            SlotState::Ready(entry) => Some(entry.snapshot.manifest().creation_time),
+            SlotState::Pending(_) => creation_time_hint,
+        };
         self.slots.push(Some(Arc::new(Slot {
             app_id,
             depot_id,
             manifest_gid,
             state,
+            creation_time,
         })));
         let snapshot_root = inode::pack(id, 0);
         self.children_of_mut(depot_dir)
@@ -234,6 +259,7 @@ impl<C: ChunkStore> MountTree<C> {
         if matches!(slot.state, SlotState::Ready(_)) {
             return;
         }
+        let creation_time = entry.snapshot.manifest().creation_time;
         // Slot is Arc'd — clone the metadata to a fresh Slot rather
         // than mutating through the Arc (which would require unique
         // ownership we don't have).
@@ -242,6 +268,7 @@ impl<C: ChunkStore> MountTree<C> {
             depot_id: slot.depot_id,
             manifest_gid: slot.manifest_gid,
             state: SlotState::Ready(entry),
+            creation_time: Some(creation_time),
         });
     }
 

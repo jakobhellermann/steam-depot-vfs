@@ -211,24 +211,38 @@ fn mount(cfg: Config) -> anyhow::Result<()> {
                 m.branch,
                 "registering manifest (lazy)"
             );
-            mount.add_lazy(m.app_id, m.depot_id, m.gid, move || {
-                let store = Arc::clone(&store);
-                let auth = Arc::clone(&auth);
-                let branch = m.branch.clone();
-                async move {
-                    tracing::info!(
-                        m.app_id,
-                        m.depot_id,
-                        m.gid,
-                        branch,
-                        "opening manifest on first access"
-                    );
-                    store
-                        .open_depot_manifest(auth, m.app_id, m.depot_id, m.gid, &branch)
-                        .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))
-                }
-            })?;
+            // Peek at the on-disk manifest cache (offline) so we can seed
+            // the `<gid>` directory's mtime with the manifest's release
+            // date even before the manifest is fetched.
+            let creation_time = store
+                .load_cached_manifest(m.app_id, m.depot_id, m.gid)
+                .ok()
+                .flatten()
+                .map(|man| man.creation_time);
+            mount.add_lazy(
+                m.app_id,
+                m.depot_id,
+                m.gid,
+                move || {
+                    let store = Arc::clone(&store);
+                    let auth = Arc::clone(&auth);
+                    let branch = m.branch.clone();
+                    async move {
+                        tracing::info!(
+                            m.app_id,
+                            m.depot_id,
+                            m.gid,
+                            branch,
+                            "opening manifest on first access"
+                        );
+                        store
+                            .open_depot_manifest(auth, m.app_id, m.depot_id, m.gid, &branch)
+                            .await
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    }
+                },
+                creation_time,
+            )?;
         }
 
         mount.wait_for_signal().await?;

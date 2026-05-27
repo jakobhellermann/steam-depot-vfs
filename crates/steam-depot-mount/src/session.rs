@@ -94,6 +94,7 @@ impl<C: ChunkStore + 'static> Mount<C> {
         depot_id: u32,
         manifest_gid: u64,
         opener: F,
+        creation_time: Option<u32>,
     ) -> Result<SnapshotId, AddError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -102,7 +103,7 @@ impl<C: ChunkStore + 'static> Mount<C> {
         let opener: Opener<C> = Arc::new(move || -> OpenerFuture<C> { Box::pin(opener()) });
         self.tree
             .write()
-            .add_lazy(app_id, depot_id, manifest_gid, opener)
+            .add_lazy(app_id, depot_id, manifest_gid, opener, creation_time)
     }
 
     /// Detach a snapshot from the mount. New lookups against its
