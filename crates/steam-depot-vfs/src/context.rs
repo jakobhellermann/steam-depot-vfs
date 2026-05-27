@@ -50,13 +50,44 @@ impl DepotStore {
         manifest_gid: u64,
         branch: &str,
     ) -> Result<DepotManifestStore<FsCacheStore<CdnChunkStore<A>>>> {
+        self.open_depot_manifest_with_chunks(auth, app_id, depot_id, manifest_gid, branch, |cdn| {
+            cdn
+        })
+        .await
+    }
+
+    /// Like [`open_depot_manifest`](Self::open_depot_manifest), but lets the
+    /// caller insert an additional [`ChunkStore`] layer between
+    /// [`CdnChunkStore`] (network) and [`FsCacheStore`] (local disk). The
+    /// closure receives the freshly-constructed CDN store and returns the
+    /// wrapped store; the result is then wrapped by `FsCacheStore` as
+    /// usual.
+    ///
+    /// Use case: instrumenting CDN fetches (per-chunk progress, byte
+    /// counters, …) without disturbing the disk cache, so cache hits stay
+    /// invisible and only real network traffic shows up in the wrapper.
+    pub async fn open_depot_manifest_with_chunks<A, F, C>(
+        &self,
+        auth: Arc<A>,
+        app_id: u32,
+        depot_id: u32,
+        manifest_gid: u64,
+        branch: &str,
+        wrap_cdn: F,
+    ) -> Result<DepotManifestStore<FsCacheStore<C>>>
+    where
+        A: SteamAuth + 'static,
+        F: FnOnce(CdnChunkStore<A>) -> C,
+        C: crate::chunk_store::ChunkStore,
+    {
         let depot_key = self.depot_keys.get_lazy(app_id, depot_id);
         let manifest = self
             .get_manifest(&auth, app_id, depot_id, manifest_gid, branch, &depot_key)
             .await?;
         let manifest = Arc::new(manifest);
         let cdn_store = CdnChunkStore::new(Arc::clone(&auth), depot_id, depot_key, &manifest);
-        let chunks = FsCacheStore::new(cdn_store, self.root.join("chunks"));
+        let wrapped = wrap_cdn(cdn_store);
+        let chunks = FsCacheStore::new(wrapped, self.root.join("chunks"));
         Ok(DepotManifestStore::new(manifest, chunks))
     }
 
