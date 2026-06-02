@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let store_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/vfs-store");
+    let store_root = std::env::var_os("STEAM_VFS_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/vfs-store"));
 
     let auth = LazyCachedAuth::prepare(
         LazyCachedAuth::default_refresh_token_cache(),
