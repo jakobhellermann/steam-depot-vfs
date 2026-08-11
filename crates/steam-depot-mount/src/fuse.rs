@@ -13,9 +13,9 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, Request,
 };
 use parking_lot::RwLock;
-use steam_depot_vfs::FileKind;
 use steam_depot_vfs::chunk_store::ChunkStore;
 use steam_depot_vfs::fs::Entry;
+use steam_depot_vfs::{DepotFile, FileKind};
 use tokio::runtime::Handle;
 
 use crate::inode::{self, SYNTHETIC};
@@ -400,7 +400,7 @@ fn resolve_snapshot_child<C: ChunkStore>(
     let manifest = entry.snapshot.manifest();
     let f = manifest.files.get(child_idx)?;
     let mtime = manifest_mtime(manifest.creation_time);
-    Some((child_ino, file_kind_attr(f.kind, child_ino, f.size, mtime)))
+    Some((child_ino, depot_file_attr(f, child_ino, mtime)))
 }
 
 fn attr_for_synthetic<C: ChunkStore>(tree: &MountTree<C>, ino: INodeNo) -> Option<FileAttr> {
@@ -420,13 +420,13 @@ fn attr_within_snapshot<C: ChunkStore>(entry: &SnapshotEntry<C>, ino: INodeNo) -
         return Some(dir_attr(ino, 0, mtime));
     }
     let f = manifest.files.get(idx as usize - 1)?;
-    Some(file_kind_attr(f.kind, ino, f.size, mtime))
+    Some(depot_file_attr(f, ino, mtime))
 }
 
-fn file_kind_attr(kind: FileKind, ino: INodeNo, size: u64, mtime: SystemTime) -> FileAttr {
-    match kind {
-        FileKind::Directory => dir_attr(ino, size, mtime),
-        FileKind::File | FileKind::Symlink => file_attr(ino, size, mtime),
+fn depot_file_attr(f: &DepotFile, ino: INodeNo, mtime: SystemTime) -> FileAttr {
+    match f.kind {
+        FileKind::Directory => dir_attr(ino, f.size, mtime),
+        FileKind::File | FileKind::Symlink => file_attr(ino, f.size, f.executable, mtime),
     }
 }
 
@@ -485,8 +485,9 @@ fn dir_attr(ino: INodeNo, size: u64, mtime: SystemTime) -> FileAttr {
     base_attr(ino, size, FileType::Directory, 0o555, 2, mtime)
 }
 
-fn file_attr(ino: INodeNo, size: u64, mtime: SystemTime) -> FileAttr {
-    base_attr(ino, size, FileType::RegularFile, 0o444, 1, mtime)
+fn file_attr(ino: INodeNo, size: u64, executable: bool, mtime: SystemTime) -> FileAttr {
+    let perm = if executable { 0o555 } else { 0o444 };
+    base_attr(ino, size, FileType::RegularFile, perm, 1, mtime)
 }
 
 fn base_attr(
