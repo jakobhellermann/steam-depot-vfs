@@ -139,18 +139,45 @@ fn fixture(fetches: Arc<AtomicUsize>) -> DepotManifestStore<MemChunks> {
     DepotManifestStore::new(Arc::new(manifest), MemChunks { chunks, fetches })
 }
 
-/// Unmounts on drop so a failing assertion can't leave a live mount
-/// behind and wedge the temp dir.
-struct MountGuard(Option<NfsMount<MemChunks>>, PathBuf);
+/// Safety net: forces the mount out if a test panics before its own
+/// `unmount`, so a failing assertion can't leave a live mount behind and
+/// wedge the temp dir. `NfsMount::unmount` is async and `Drop` isn't, so
+/// this shells out directly.
+struct MountGuard {
+    mountpoint: PathBuf,
+    armed: bool,
+}
+
+impl MountGuard {
+    fn new(mountpoint: PathBuf) -> Self {
+        Self {
+            mountpoint,
+            armed: true,
+        }
+    }
+
+    /// Call after a successful `NfsMount::unmount` — there is nothing
+    /// left to force out.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for MountGuard {
     fn drop(&mut self) {
-        if let Some(mount) = self.0.take()
-            && let Err(e) = mount.unmount()
-        {
-            eprintln!("unmount failed: {e}");
+        if self.armed {
+            let status = std::process::Command::new("umount")
+                .arg("-f")
+                .arg(&self.mountpoint)
+                .status();
+            if !matches!(status, Ok(s) if s.success()) {
+                eprintln!(
+                    "forced unmount of {} failed: {status:?}",
+                    self.mountpoint.display()
+                );
+            }
         }
-        let _ = std::fs::remove_dir_all(&self.1);
+        let _ = std::fs::remove_dir_all(&self.mountpoint);
     }
 }
 
@@ -173,7 +200,7 @@ async fn serves_a_manifest_over_the_platform_nfs_client() {
     mount
         .add(1000, 4242, 99, fixture(Arc::clone(&fetches)))
         .expect("add");
-    let guard = MountGuard(Some(mount), mountpoint.clone());
+    let guard = MountGuard::new(mountpoint.clone());
 
     let root = mountpoint.join("1000/4242/99");
 
@@ -237,7 +264,8 @@ async fn serves_a_manifest_over_the_platform_nfs_client() {
         "executables run from the mount (no noexec)",
     );
 
-    drop(guard);
+    mount.unmount().await.expect("unmount");
+    guard.disarm();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -267,7 +295,7 @@ async fn opens_a_manifest_only_on_first_access() {
             Some(CREATION_TIME),
         )
         .expect("add_lazy");
-    let guard = MountGuard(Some(mount), mountpoint.clone());
+    let guard = MountGuard::new(mountpoint.clone());
 
     let root = mountpoint.join("1000/4242/99");
     assert_eq!(
@@ -300,7 +328,8 @@ async fn opens_a_manifest_only_on_first_access() {
         "and pulls only the one chunk that read needs",
     );
 
-    drop(guard);
+    mount.unmount().await.expect("unmount");
+    guard.disarm();
 }
 
 fn read_names(dir: &Path) -> Vec<String> {
@@ -315,4 +344,111 @@ fn read_names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// True if the kernel's mount table lists `path`. Deliberately asks the
+/// kernel and not the filesystem: a mount whose server is gone hangs
+/// every `stat` on it forever.
+fn mount_count(path: &Path) -> usize {
+    let listing = std::process::Command::new("mount")
+        .output()
+        .expect("run mount");
+    // `mount` prints resolved paths (/private/var/…, not /var/…).
+    let resolved = path
+        .parent()
+        .expect("mountpoint has a parent")
+        .canonicalize()
+        .expect("canonicalize parent")
+        .join(path.file_name().expect("mountpoint has a name"));
+    let needle = format!(" on {} ", resolved.display());
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter(|l| l.contains(&needle))
+        .count()
+}
+
+/// A process holding a mount can die without unmounting — every access
+/// to the mountpoint then hangs until someone runs `umount -f`. Starting
+/// a fresh mount over it has to clean that up.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovers_from_a_mount_left_behind_by_a_crash() {
+    let mountpoint = temp_mountpoint("crashed");
+    let hello = mountpoint.join("1000/4242/99/hello.txt");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_nfs-demo"))
+        .arg(&mountpoint)
+        .spawn()
+        .expect("spawn nfs-demo");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while mount_count(&mountpoint) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nfs-demo never mounted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&hello).expect("read from the doomed mount"),
+        "hello\n",
+    );
+
+    child.kill().expect("kill nfs-demo");
+    child.wait().expect("reap nfs-demo");
+    assert_eq!(
+        mount_count(&mountpoint),
+        1,
+        "the dead process leaves its mount behind",
+    );
+
+    let mount = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        NfsMount::start(NfsMountConfig::new(mountpoint.clone())),
+    )
+    .await
+    .expect("start must not hang on the stale mount")
+    .expect("start over a stale mount");
+    mount
+        .add(1000, 4242, 99, fixture(Arc::new(AtomicUsize::new(0))))
+        .expect("add");
+    let guard = MountGuard::new(mountpoint.clone());
+
+    assert_eq!(
+        mount_count(&mountpoint),
+        1,
+        "the stale mount is replaced, not stacked under a second one",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&hello).expect("read from the fresh mount"),
+        "first-chunk;second-chunk\n",
+        "reads hit the new mount",
+    );
+
+    mount.unmount().await.expect("unmount");
+    guard.disarm();
+}
+
+/// Dropping the handle has to take the mount with it: a mount whose
+/// server is gone hangs every access to it, and callers do drop handles
+/// they can't unmount (a stop that can't reclaim its `Arc`, a panic
+/// unwinding past one).
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_handle_takes_the_mount_with_it() {
+    let mountpoint = temp_mountpoint("dropped");
+    let guard = MountGuard::new(mountpoint.clone());
+    let mount = NfsMount::start(NfsMountConfig::new(mountpoint.clone()))
+        .await
+        .expect("mount");
+    mount
+        .add(1000, 4242, 99, fixture(Arc::new(AtomicUsize::new(0))))
+        .expect("add");
+    assert_eq!(mount_count(&mountpoint), 1, "mounted");
+
+    drop(mount);
+
+    assert_eq!(
+        mount_count(&mountpoint),
+        0,
+        "the drop unmounted instead of leaking the mount",
+    );
+    guard.disarm();
 }
