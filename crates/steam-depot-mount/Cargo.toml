@@ -11,7 +11,7 @@ default = []
 fuse = ["dep:fuser", "dep:libc"]
 # Multi-threaded runtime for the dev bins, so their measurements
 # reflect how an embedder actually runs the server.
-probe = ["nfs", "tokio/rt-multi-thread", "dep:tracing-subscriber"]
+probe = ["nfs", "tokio/rt-multi-thread", "dep:tracing-subscriber", "dep:sha1"]
 # Loopback NFSv3 back end, mounted with the platform NFS client.
 # The back end does networking, so it needs tokio's net driver.
 nfs = ["dep:nfsserve", "dep:async-trait", "dep:libc", "tokio/net", "tokio/process", "tokio/time"]
@@ -31,6 +31,7 @@ async-trait = { version = "0.1.92", optional = true }
 fuser = { version = "0.17.0", optional = true, features = ["macos-no-mount"] }
 libc = { version = "0.2.186", optional = true }
 nfsserve = { version = "0.11.0", optional = true }
+sha1 = { version = "0.11.0", optional = true }
 tracing-subscriber = { workspace = true, optional = true, features = ["env-filter"] }
 
 [dev-dependencies]
