@@ -257,6 +257,18 @@ impl<C: ChunkStore> DepotManifestStore<C> {
                 .map_err(std::io::Error::other)?;
             let slice_start = offset.saturating_sub(c_start) as usize;
             let slice_end = (end.min(c_end) - c_start) as usize;
+            // A store that hands back fewer bytes than the manifest
+            // promises would panic the slice below, and a panic inside a
+            // read is a hung filesystem for whoever is mounting us.
+            if bytes.len() < slice_end {
+                return Err(std::io::Error::other(format!(
+                    "chunk {} of '{}' is {} bytes, manifest says {}",
+                    c.sha,
+                    f.path,
+                    bytes.len(),
+                    c.size_uncompressed,
+                )));
+            }
             out.extend_from_slice(&bytes[slice_start..slice_end]);
         }
         Ok(())
@@ -417,4 +429,67 @@ fn parent_of(path: &str) -> Option<&str> {
 
 fn strip_leading_slash(p: &str) -> &str {
     p.strip_prefix('/').unwrap_or(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use steam_vent_depot::{Chunk, ChunkHash, DepotFile, FileKind, Manifest};
+
+    use super::*;
+
+    /// Reports fewer bytes than the manifest promises, the way a
+    /// truncated cache file does.
+    struct ShortChunks;
+
+    impl ChunkStore for ShortChunks {
+        async fn get(&self, _sha: ChunkHash) -> crate::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+    }
+
+    fn one_chunk_file() -> DepotManifestStore<ShortChunks> {
+        let manifest = Manifest {
+            depot_id: 1,
+            manifest_id: 2,
+            creation_time: 0,
+            size_uncompressed: 0,
+            size_compressed: 0,
+            files: vec![DepotFile {
+                path: "a.bin".into(),
+                size: 1024,
+                kind: FileKind::File,
+                executable: false,
+                sha: None,
+                linktarget: None,
+                chunks: vec![Chunk {
+                    sha: ChunkHash([1; 20]),
+                    crc: 0,
+                    offset: 0,
+                    size_uncompressed: 1024,
+                    size_compressed: 1024,
+                }],
+            }],
+        };
+        DepotManifestStore::new(Arc::new(manifest), ShortChunks)
+    }
+
+    /// A read that panics takes the whole filesystem serving it with
+    /// it, so a chunk that doesn't match the manifest has to be an
+    /// error the caller can turn into EIO.
+    #[tokio::test]
+    async fn a_short_chunk_is_an_error_not_a_panic() {
+        let store = one_chunk_file();
+        let mut out = Vec::new();
+        let err = store
+            .read_into("a.bin", 0, 1024, &mut out)
+            .await
+            .expect_err("a short chunk must fail the read");
+        let message = err.to_string();
+        assert!(
+            message.contains("is 0 bytes, manifest says 1024"),
+            "unexpected error: {message}",
+        );
+    }
 }
