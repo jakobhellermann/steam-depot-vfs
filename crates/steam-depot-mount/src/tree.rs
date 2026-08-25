@@ -17,12 +17,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use fuser::INodeNo;
 use steam_depot_vfs::chunk_store::ChunkStore;
 use steam_depot_vfs::fs::DepotManifestStore;
 use tokio::sync::OnceCell;
 
-use crate::inode::{self, SYNTHETIC};
+use crate::inode::{self, Ino, SYNTHETIC};
 
 /// Stable handle to a mounted snapshot. Becomes invalid once
 /// [`MountTree::remove`] is called for it; the id is never reused.
@@ -62,11 +61,11 @@ pub(crate) struct Slot<C: ChunkStore> {
 
 pub(crate) struct MountTree<C: ChunkStore> {
     /// Index 1 is the root. Slot 0 is unused (kept so indices line up
-    /// with [`fuser::INodeNo::ROOT`]).
+    /// with [`inode::ROOT`]).
     synthetic: Vec<SyntheticDir>,
     /// Map from "/app_id" or "/app_id/depot_id" path to the synthetic
     /// dir representing it. Used by [`MountTree::ensure_synthetic`].
-    synth_by_path: HashMap<String, INodeNo>,
+    synth_by_path: HashMap<String, Ino>,
     /// Indexed by `SnapshotId.0`. Slot 0 is unused (snapshot ids start
     /// at 1 so `(synthetic, *)` and `(snapshot 1, *)` are distinct).
     ///
@@ -79,11 +78,11 @@ pub(crate) struct MountTree<C: ChunkStore> {
 /// A synthetic directory in the mount prefix.
 pub(crate) struct SyntheticDir {
     /// Parent inode. None only for the root.
-    pub parent: Option<INodeNo>,
+    pub parent: Option<Ino>,
     /// Display name for this entry, e.g. "1030300".
     pub name: String,
     /// Children indexed by name. Values are inodes.
-    pub children: HashMap<String, INodeNo>,
+    pub children: HashMap<String, Ino>,
 }
 
 /// Loaded contents of a mounted manifest. The owning [`Slot`] carries
@@ -96,7 +95,7 @@ pub(crate) struct SnapshotEntry<C: ChunkStore> {
 impl<C: ChunkStore> MountTree<C> {
     pub fn new() -> Self {
         let mut synthetic = Vec::with_capacity(4);
-        // Slot 0: placeholder so slot indices map to INodeNo values.
+        // Slot 0: placeholder so slot indices map to node ids.
         synthetic.push(SyntheticDir {
             parent: None,
             name: String::new(),
@@ -235,7 +234,7 @@ impl<C: ChunkStore> MountTree<C> {
         Some(entry)
     }
 
-    pub fn synthetic(&self, ino: INodeNo) -> Option<&SyntheticDir> {
+    pub fn synthetic(&self, ino: Ino) -> Option<&SyntheticDir> {
         let (sid, idx) = inode::unpack(ino);
         if sid != SYNTHETIC {
             return None;
@@ -272,7 +271,7 @@ impl<C: ChunkStore> MountTree<C> {
         });
     }
 
-    fn ensure_synthetic(&mut self, parent: INodeNo, name: String) -> INodeNo {
+    fn ensure_synthetic(&mut self, parent: Ino, name: String) -> Ino {
         if let Some(&existing) = self.children_of(parent).get(&name) {
             return existing;
         }
@@ -294,13 +293,13 @@ impl<C: ChunkStore> MountTree<C> {
         ino
     }
 
-    fn children_of(&self, ino: INodeNo) -> &HashMap<String, INodeNo> {
+    fn children_of(&self, ino: Ino) -> &HashMap<String, Ino> {
         let (sid, idx) = inode::unpack(ino);
         debug_assert_eq!(sid, SYNTHETIC, "children_of called with non-synthetic ino");
         &self.synthetic[idx as usize].children
     }
 
-    fn children_of_mut(&mut self, ino: INodeNo) -> &mut HashMap<String, INodeNo> {
+    fn children_of_mut(&mut self, ino: Ino) -> &mut HashMap<String, Ino> {
         let (sid, idx) = inode::unpack(ino);
         debug_assert_eq!(
             sid, SYNTHETIC,
@@ -309,7 +308,7 @@ impl<C: ChunkStore> MountTree<C> {
         &mut self.synthetic[idx as usize].children
     }
 
-    fn path_of_synthetic(&self, ino: INodeNo) -> String {
+    fn path_of_synthetic(&self, ino: Ino) -> String {
         if ino == inode::ROOT {
             return String::new();
         }

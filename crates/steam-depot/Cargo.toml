@@ -28,4 +28,4 @@ tracing-perfetto = "0.1.5"
 tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-steam-depot-mount = { path = "../steam-depot-mount" }
+steam-depot-mount = { path = "../steam-depot-mount", features = ["fuse"] }
