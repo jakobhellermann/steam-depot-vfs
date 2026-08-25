@@ -79,11 +79,18 @@ impl<C: ChunkStore + 'static> NfsFs<C> {
 #[async_trait]
 impl<C: ChunkStore + 'static> NFSFileSystem for NfsFs<C> {
     fn capabilities(&self) -> VFSCapabilities {
-        // Not a lie we enjoy: nfsserve masks ACCESS3_EXECUTE out of every
-        // ACCESS reply for a `ReadOnly` filesystem, so `access(X_OK)`
-        // fails and nothing on the mount can be executed. Every write
-        // method below answers ROFS and the client mounts `rdonly`, so
-        // claiming ReadWrite costs nothing and buys back exec.
+        // ReadWrite on a read-only filesystem: nfsserve masks
+        // ACCESS3_EXECUTE out of every ACCESS reply for a `ReadOnly`
+        // one, and the client treats that reply as authoritative, so
+        // nothing on the mount could be executed. The write methods
+        // below answer ROFS and the client mounts `rdonly`, so the
+        // claim changes nothing else.
+        //
+        // Execution matters here: a macOS game bundle launches from the
+        // mount, and only because of this reply — every file reports
+        // mode 444, since Steam's manifests carry no executable flag
+        // and the app's launch config is the only place naming runnable
+        // targets. Honest permissions need that config first.
         VFSCapabilities::ReadWrite
     }
 
