@@ -20,6 +20,17 @@ use steam_vent_depot::{Chunk, ChunkHash, DepotFile, FileKind, Manifest};
 const CHUNK: usize = 1 << 20;
 const CHUNKS: usize = 40;
 
+/// The store is content-addressed and verifies what it reads back, so a
+/// chunk's name has to be the SHA-1 of its bytes — otherwise the cache
+/// throws every chunk away as corrupt and the measurement is nonsense.
+fn chunk_of(index: usize) -> (ChunkHash, Bytes) {
+    let bytes = Bytes::from(vec![index as u8; CHUNK]);
+    let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
+    sha1::Digest::update(&mut hasher, &bytes);
+    let digest: [u8; 20] = sha1::Digest::finalize(hasher).into();
+    (ChunkHash(digest), bytes)
+}
+
 #[derive(Default)]
 struct Stats {
     /// Fetches per chunk, so repeats are visible.
@@ -34,6 +45,7 @@ struct Stats {
 struct CountingChunks {
     delay: Duration,
     stats: Arc<Mutex<Stats>>,
+    chunks: HashMap<[u8; 20], Bytes>,
 }
 
 impl ChunkStore for CountingChunks {
@@ -49,14 +61,17 @@ impl ChunkStore for CountingChunks {
         let mut s = self.stats.lock().expect("stats");
         s.inflight -= 1;
         s.last = Some(Instant::now());
-        Ok(Bytes::from(vec![sha.0[0]; CHUNK]))
+        self.chunks
+            .get(&sha.0)
+            .cloned()
+            .ok_or(VfsError::ChunkNotInManifest(sha))
     }
 }
 
 fn manifest() -> Manifest {
     let chunks: Vec<Chunk> = (0..CHUNKS)
         .map(|i| Chunk {
-            sha: ChunkHash([i as u8; 20]),
+            sha: chunk_of(i).0,
             crc: 0,
             offset: (i * CHUNK) as u64,
             size_uncompressed: CHUNK as u32,
@@ -111,6 +126,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let counting = CountingChunks {
         delay,
         stats: Arc::clone(&stats),
+        chunks: (0..CHUNKS)
+            .map(chunk_of)
+            .map(|(sha, b)| (sha.0, b))
+            .collect(),
     };
     let mount = NfsMount::start(NfsMountConfig::new(mountpoint.clone().into())).await?;
     mount.add(

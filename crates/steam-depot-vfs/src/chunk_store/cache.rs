@@ -1,12 +1,13 @@
 // TODO(ai-review): review for correctness/style
 //! Local-disk write-through cache wrapping any other [`ChunkStore`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
+use sha1::{Digest, Sha1};
 use steam_vent_depot::ChunkHash;
 use tokio::io::AsyncWriteExt;
 
@@ -22,12 +23,22 @@ use crate::{chunk_store::CdnChunkStore, error::Result};
 /// time: a mounted filesystem turns a single client read into a dozen
 /// concurrent reads of the same chunk, and fetching per read would multiply
 /// the download by that factor.
+///
+/// What comes off the disk is checked against the name it is filed under
+/// before it is handed out, and refetched if it doesn't match. Writes here
+/// skip `fsync`, so a chunk file can survive a power cut with the right
+/// length and the wrong bytes — and serving that would hand corrupt data
+/// to every later reader.
 pub struct FsCacheStore<Inner: ChunkStore = CdnChunkStore> {
     inner: Inner,
     root: PathBuf,
     /// One lock per chunk being fetched. Entries are dropped once the
     /// last waiter is gone, so this doesn't grow with the cache.
     fetching: Mutex<HashMap<ChunkHash, Weak<tokio::sync::Mutex<()>>>>,
+    /// Chunks already checked in this process. The check costs one hash
+    /// per chunk rather than one per read, which matters because a
+    /// mounted filesystem reads each chunk many times over.
+    verified: Mutex<HashSet<ChunkHash>>,
 }
 
 impl<Inner: ChunkStore> FsCacheStore<Inner> {
@@ -41,6 +52,7 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
             inner,
             root,
             fetching: Mutex::new(HashMap::new()),
+            verified: Mutex::new(HashSet::new()),
         }
     }
 
@@ -65,18 +77,18 @@ impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
     #[tracing::instrument(level = "debug", name = "fs_cache.get", skip_all)]
     async fn get(&self, sha: ChunkHash) -> Result<Bytes> {
         let path = self.path_for(sha);
-        if let Ok(bytes) = tokio::fs::read(&path).await {
+        if let Some(bytes) = self.read_verified(sha, &path).await {
             tracing::debug!(%sha, bytes = bytes.len(), "cache hit");
-            return Ok(Bytes::from(bytes));
+            return Ok(bytes);
         }
         let lock = self.fetch_lock(sha);
         let _fetching = lock.lock().await;
         // Whoever held the lock has written the chunk by now. Checking
         // the file rather than passing the bytes along keeps this to one
         // lock and no result plumbing; the loser pays a disk read.
-        if let Ok(bytes) = tokio::fs::read(&path).await {
+        if let Some(bytes) = self.read_verified(sha, &path).await {
             tracing::debug!(%sha, bytes = bytes.len(), "cache hit after waiting for a fetch");
-            return Ok(Bytes::from(bytes));
+            return Ok(bytes);
         }
         self.fetch_and_persist(sha, &path).await
     }
@@ -126,7 +138,43 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
         tracing::debug!(%sha, "cache miss, fetching from inner store");
         let bytes = self.inner.get(sha).await?;
         self.write_atomic(path, &bytes).await?;
+        // The inner store vouches for what it hands out — the CDN one
+        // checks each chunk's Adler-32 — so what we just wrote needs no
+        // hashing to be trusted for the rest of this process.
+        self.verified.lock().expect("verified poisoned").insert(sha);
         Ok(bytes)
+    }
+
+    /// The cached chunk at `path`, or `None` if there is nothing usable
+    /// there. A file whose bytes don't hash to `sha` is deleted rather
+    /// than returned, so the next reader refetches instead of finding
+    /// the same corruption.
+    async fn read_verified(&self, sha: ChunkHash, path: &std::path::Path) -> Option<Bytes> {
+        let bytes = Bytes::from(tokio::fs::read(path).await.ok()?);
+        if self
+            .verified
+            .lock()
+            .expect("verified poisoned")
+            .contains(&sha)
+        {
+            return Some(bytes);
+        }
+        let mut hasher = Sha1::new();
+        hasher.update(&bytes);
+        let digest: [u8; 20] = hasher.finalize().into();
+        if digest != sha.0 {
+            tracing::error!(
+                %sha,
+                bytes = bytes.len(),
+                "cached chunk does not hash to its name; deleting it and refetching",
+            );
+            if let Err(e) = tokio::fs::remove_file(path).await {
+                tracing::error!(%sha, %e, "could not delete the corrupt chunk");
+            }
+            return None;
+        }
+        self.verified.lock().expect("verified poisoned").insert(sha);
+        Some(bytes)
     }
 
     /// Write `bytes` to `path` atomically: write a sibling temporary
@@ -159,10 +207,21 @@ mod tests {
 
     const CHUNK_LEN: usize = 65_536;
 
+    /// The cache is content-addressed: a chunk's name is the SHA-1 of
+    /// its bytes, which is what makes it verifiable.
+    fn chunk_bytes(fill: u8) -> (ChunkHash, Bytes) {
+        let bytes = Bytes::from(vec![fill; CHUNK_LEN]);
+        let mut hasher = <sha1::Sha1 as sha1::Digest>::new();
+        sha1::Digest::update(&mut hasher, &bytes);
+        let digest: [u8; 20] = sha1::Digest::finalize(hasher).into();
+        (ChunkHash(digest), bytes)
+    }
+
     /// Hands out a fixed chunk, after yielding often enough that
     /// concurrent callers interleave inside the cache's write path.
     struct SlowInner {
         fetches: Arc<AtomicUsize>,
+        fill: u8,
     }
 
     impl ChunkStore for SlowInner {
@@ -171,7 +230,7 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
-            Ok(Bytes::from(vec![0x5a; CHUNK_LEN]))
+            Ok(chunk_bytes(self.fill).1)
         }
     }
 
@@ -193,10 +252,11 @@ mod tests {
         let store = Arc::new(FsCacheStore::new(
             SlowInner {
                 fetches: Arc::clone(&fetches),
+                fill: 0x5a,
             },
             dir.clone(),
         ));
-        let sha = ChunkHash([9; 20]);
+        let (sha, _) = chunk_bytes(0x5a);
 
         let mut tasks = Vec::new();
         for _ in 0..16 {
@@ -230,10 +290,11 @@ mod tests {
         let store = Arc::new(FsCacheStore::new(
             SlowInner {
                 fetches: Arc::clone(&fetches),
+                fill: 0x5a,
             },
             dir.clone(),
         ));
-        let sha = ChunkHash([7; 20]);
+        let (sha, _) = chunk_bytes(0x5a);
 
         // Several rounds: each one starts from a cold cache, so every
         // task takes the miss path and races the others.
@@ -258,6 +319,52 @@ mod tests {
             // A cached chunk must be readable as such afterwards.
             assert_eq!(store.get(sha).await.expect("cache hit").len(), CHUNK_LEN);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk file that reads back with the right length but the wrong
+    /// bytes — what a torn write leaves behind, since the cache skips
+    /// fsync. Serving that forever would hand out corrupt data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_corrupt_cache_file_is_replaced_not_served() {
+        let dir = std::env::temp_dir().join(format!("fs-cache-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create cache dir");
+        let (sha, good) = chunk_bytes(0x5a);
+        std::fs::write(dir.join(sha.to_string()), vec![0; CHUNK_LEN]).expect("plant corruption");
+
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let store = FsCacheStore::new(
+            SlowInner {
+                fetches: Arc::clone(&fetches),
+                fill: 0x5a,
+            },
+            dir.clone(),
+        );
+
+        assert_eq!(
+            store.get(sha).await.expect("get"),
+            good,
+            "the read is served the real bytes"
+        );
+        assert_eq!(
+            fetches.load(Ordering::Relaxed),
+            1,
+            "the corrupt file was refetched"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(sha.to_string())).expect("cached file"),
+            good,
+            "and replaced on disk",
+        );
+
+        assert_eq!(store.get(sha).await.expect("get"), good);
+        assert_eq!(
+            fetches.load(Ordering::Relaxed),
+            1,
+            "the repaired file is then served from disk",
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
