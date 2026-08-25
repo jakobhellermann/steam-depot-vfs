@@ -3,10 +3,13 @@
 //! callbacks to async operations on a Tokio runtime supplied by the
 //! caller. We hold a `Handle`, not a `Runtime`, so the FUSE adapter
 //! shares the binary's main runtime instead of building its own.
+//!
+//! The tree walking itself lives in [`crate::view`]; what's left here is
+//! fuser's callback protocol and the [`Node`] → [`FileAttr`] mapping.
 
 use std::ffi::OsStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
     Errno, FileAttr, FileType, Filesystem, Generation, INodeNo, OpenFlags, ReplyAttr, ReplyData,
@@ -14,12 +17,11 @@ use fuser::{
 };
 use parking_lot::RwLock;
 use steam_depot_vfs::chunk_store::ChunkStore;
-use steam_depot_vfs::fs::Entry;
-use steam_depot_vfs::{DepotFile, FileKind};
 use tokio::runtime::Handle;
 
-use crate::inode::{self, SYNTHETIC};
-use crate::tree::{LazyEntry, MountTree, SlotState, SnapshotEntry, SnapshotId};
+use crate::inode::{self, Ino, SYNTHETIC};
+use crate::tree::{MountTree, SnapshotEntry, SnapshotId};
+use crate::view::{self, Node, NodeKind, SlotLookup};
 
 /// FUSE attribute TTL. Snapshots are immutable for their lifetime; on
 /// snapshot remove the kernel will see ENOENT only after this expires.
@@ -35,52 +37,6 @@ impl<C: ChunkStore + 'static> FuseFs<C> {
     pub fn new(tree: Arc<RwLock<MountTree<C>>>, rt: Handle) -> Self {
         Self { tree, rt }
     }
-
-    /// Look up `sid` in the tree.
-    fn slot_lookup(&self, sid: inode::SnapshotId) -> SlotLookup<C> {
-        let tree = self.tree.read();
-        let Some(slot) = tree.slot(sid) else {
-            return SlotLookup::Missing;
-        };
-        match &slot.state {
-            SlotState::Ready(entry) => SlotLookup::Ready(Arc::clone(entry)),
-            SlotState::Pending(lazy) => SlotLookup::Pending(Arc::clone(lazy)),
-        }
-    }
-
-    /// Drive a pending lazy opener (if not already done) and promote
-    /// the slot to `Ready`. Concurrent callers coalesce on the slot's
-    /// `OnceCell`.
-    async fn resolve(
-        tree: Arc<RwLock<MountTree<C>>>,
-        lazy: Arc<LazyEntry<C>>,
-        sid: SnapshotId,
-    ) -> Result<Arc<SnapshotEntry<C>>, String> {
-        let cell = Arc::clone(&lazy.cell);
-        let opener = Arc::clone(&lazy.opener);
-        let result = cell
-            .get_or_init(|| async move {
-                match (opener)().await {
-                    Ok(store) => Ok(Arc::new(SnapshotEntry { snapshot: store })),
-                    Err(e) => Err(e.to_string()),
-                }
-            })
-            .await
-            .clone()?;
-        tree.write().promote(sid, Arc::clone(&result));
-        Ok(result)
-    }
-}
-
-/// Outcome of looking up a snapshot slot — three-way so callsites can
-/// branch on it without nested `Option`/`Result`.
-enum SlotLookup<C: ChunkStore> {
-    /// Slot is loaded; serve from `entry` directly.
-    Ready(Arc<SnapshotEntry<C>>),
-    /// Slot is registered but not yet opened. Drive the opener.
-    Pending(Arc<LazyEntry<C>>),
-    /// `sid` is out of bounds or the slot was removed. Reply ENOENT.
-    Missing,
 }
 
 impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
@@ -89,45 +45,26 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
             reply.error(Errno::ENOENT);
             return;
         };
+        let parent = parent.0;
         let (sid, _) = inode::unpack(parent);
         if sid == SYNTHETIC {
             // Synthetic dirs are fully described by the tree itself.
-            let tree = self.tree.read();
-            match resolve_synthetic_child(&tree, parent, name) {
-                Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
+            match view::synthetic_child(&self.tree.read(), parent, name) {
+                Some(node) => reply.entry(&TTL, &attr_of(&node), Generation(0)),
                 None => reply.error(Errno::ENOENT),
             }
             return;
         }
-        // Inside a snapshot subtree — make sure it's resolved first.
-        let entry = match self.slot_lookup(sid) {
-            SlotLookup::Ready(e) => e,
-            SlotLookup::Pending(lazy) => {
-                let tree = Arc::clone(&self.tree);
-                let name = name.to_string();
-                self.rt.spawn(async move {
-                    match Self::resolve(tree, lazy, SnapshotId(sid)).await {
-                        Ok(entry) => match resolve_snapshot_child(&entry, parent, &name) {
-                            Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
-                            None => reply.error(Errno::ENOENT),
-                        },
-                        Err(e) => {
-                            tracing::warn!(%e, "lazy resolve failed during lookup");
-                            reply.error(Errno::EIO);
-                        }
-                    }
-                });
-                return;
-            }
-            SlotLookup::Missing => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        match resolve_snapshot_child(&entry, parent, name) {
-            Some((_ino, attr)) => reply.entry(&TTL, &attr, Generation(0)),
-            None => reply.error(Errno::ENOENT),
-        }
+        let name = name.to_string();
+        self.with_snapshot(
+            sid,
+            "lookup",
+            reply,
+            move |entry, reply| match view::snapshot_child(entry, parent, &name) {
+                Some(node) => reply.entry(&TTL, &attr_of(&node), Generation(0)),
+                None => reply.error(Errno::ENOENT),
+            },
+        );
     }
 
     fn getattr(
@@ -137,61 +74,38 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         _fh: Option<fuser::FileHandle>,
         reply: ReplyAttr,
     ) {
-        let (sid, _) = inode::unpack(ino);
+        let ino = ino.0;
+        let (sid, idx) = inode::unpack(ino);
         if sid == SYNTHETIC {
-            let tree = self.tree.read();
-            match attr_for_synthetic(&tree, ino) {
-                Some(attr) => reply.attr(&TTL, &attr),
+            match view::synthetic_node(&self.tree.read(), ino) {
+                Some(node) => reply.attr(&TTL, &attr_of(&node)),
                 None => reply.error(Errno::ENOENT),
             }
             return;
         }
-        // Inside a snapshot. For idx==0 (the gid root) we can answer
-        // without resolving, since it's just "a directory" until we
-        // need actual file metadata.
-        let (_, idx) = inode::unpack(ino);
+        // Snapshot root: answer without resolving so we don't force a
+        // manifest fetch just for getattr. mtime falls back to the
+        // epoch until the slot has a cached `creation_time` (set on
+        // eager add and on lazy promote).
         if idx == 0 {
-            // Snapshot root: answer without resolving so we don't force a
-            // manifest fetch just for getattr. mtime falls back to EPOCH
-            // until the slot has a cached `creation_time` (set on eager
-            // add and on lazy promote).
-            let mtime = self
-                .tree
-                .read()
-                .slot(sid)
-                .and_then(|s| s.creation_time)
-                .map(manifest_mtime)
-                .unwrap_or(UNIX_EPOCH);
-            reply.attr(&TTL, &dir_attr(ino, 0, mtime));
-            return;
-        }
-        let entry = match self.slot_lookup(sid) {
-            SlotLookup::Ready(e) => e,
-            SlotLookup::Pending(lazy) => {
-                let tree = Arc::clone(&self.tree);
-                self.rt.spawn(async move {
-                    match Self::resolve(tree, lazy, SnapshotId(sid)).await {
-                        Ok(entry) => match attr_within_snapshot(&entry, ino) {
-                            Some(attr) => reply.attr(&TTL, &attr),
-                            None => reply.error(Errno::ENOENT),
-                        },
-                        Err(e) => {
-                            tracing::warn!(%e, "lazy resolve failed during getattr");
-                            reply.error(Errno::EIO);
-                        }
-                    }
-                });
-                return;
-            }
-            SlotLookup::Missing => {
+            let tree = self.tree.read();
+            if tree.slot(sid).is_none() {
                 reply.error(Errno::ENOENT);
                 return;
             }
-        };
-        match attr_within_snapshot(&entry, ino) {
-            Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(Errno::ENOENT),
+            let node = Node::dir(ino, view::slot_mtime(&tree, sid));
+            reply.attr(&TTL, &attr_of(&node));
+            return;
         }
+        self.with_snapshot(
+            sid,
+            "getattr",
+            reply,
+            move |entry, reply| match view::snapshot_node(entry, ino) {
+                Some(node) => reply.attr(&TTL, &attr_of(&node)),
+                None => reply.error(Errno::ENOENT),
+            },
+        );
     }
 
     fn readdir(
@@ -202,46 +116,19 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         offset: u64,
         reply: ReplyDirectory,
     ) {
+        let ino = ino.0;
         let (sid, _) = inode::unpack(ino);
         if sid == SYNTHETIC {
-            let entries = {
-                let tree = self.tree.read();
-                match collect_synthetic_dir(&tree, ino) {
-                    Some(e) => e,
-                    None => {
-                        reply.error(Errno::ENOENT);
-                        return;
-                    }
-                }
-            };
-            emit_readdir(ino, &entries, offset, reply);
+            match view::synthetic_dir(&self.tree.read(), ino) {
+                Some(entries) => emit_readdir(ino, &entries, offset, reply),
+                None => reply.error(Errno::ENOENT),
+            }
             return;
         }
-        let entry = match self.slot_lookup(sid) {
-            SlotLookup::Ready(e) => e,
-            SlotLookup::Pending(lazy) => {
-                let tree = Arc::clone(&self.tree);
-                self.rt.spawn(async move {
-                    match Self::resolve(tree, lazy, SnapshotId(sid)).await {
-                        Ok(entry) => {
-                            let kids = collect_snapshot_dir(&entry, ino).unwrap_or_default();
-                            emit_readdir(ino, &kids, offset, reply);
-                        }
-                        Err(e) => {
-                            tracing::warn!(%e, "lazy resolve failed during readdir");
-                            reply.error(Errno::EIO);
-                        }
-                    }
-                });
-                return;
-            }
-            SlotLookup::Missing => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        let kids = collect_snapshot_dir(&entry, ino).unwrap_or_default();
-        emit_readdir(ino, &kids, offset, reply);
+        self.with_snapshot(sid, "readdir", reply, move |entry, reply| {
+            let entries = view::snapshot_dir(entry, ino).unwrap_or_default();
+            emit_readdir(ino, &entries, offset, reply);
+        });
     }
 
     fn read(
@@ -255,7 +142,7 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let (sid, idx) = inode::unpack(ino);
+        let (sid, idx) = inode::unpack(ino.0);
         if sid == SYNTHETIC {
             reply.error(Errno::EISDIR);
             return;
@@ -264,42 +151,28 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
             reply.error(Errno::EISDIR);
             return;
         };
-        let tree_arc = Arc::clone(&self.tree);
-        let initial = self.slot_lookup(sid);
+        let tree = Arc::clone(&self.tree);
+        let initial = view::slot_lookup(&self.tree, sid);
         self.rt.spawn(async move {
-            let entry = match initial {
-                SlotLookup::Ready(e) => e,
-                SlotLookup::Pending(lazy) => {
-                    match Self::resolve(tree_arc, lazy, SnapshotId(sid)).await {
-                        Ok(e) => e,
-                        Err(e) => {
-                            tracing::warn!(%e, "lazy resolve failed during read");
-                            reply.error(Errno::EIO);
-                            return;
-                        }
-                    }
-                }
-                SlotLookup::Missing => {
-                    reply.error(Errno::ENOENT);
+            let entry = match resolve_lookup(tree, initial, sid, "read").await {
+                Ok(entry) => entry,
+                Err(errno) => {
+                    reply.error(errno);
                     return;
                 }
             };
-            let path = match entry.snapshot.manifest().files.get(file_idx) {
-                Some(file) => {
-                    if matches!(file.kind, FileKind::Symlink) {
-                        tracing::warn!(
-                            path = %file.path,
-                            target = ?file.linktarget,
-                            "reading symlink as regular file; link target not resolved",
-                        );
-                    }
-                    file.path.clone()
-                }
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
+            let Some(file) = entry.snapshot.manifest().files.get(file_idx) else {
+                reply.error(Errno::ENOENT);
+                return;
             };
+            if file.linktarget.is_some() {
+                tracing::warn!(
+                    path = %file.path,
+                    target = ?file.linktarget,
+                    "reading symlink as regular file; link target not resolved",
+                );
+            }
+            let path = file.path.clone();
             let mut buf = Vec::with_capacity(size as usize);
             match entry
                 .snapshot
@@ -324,185 +197,124 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
     }
 }
 
+/// Everything a fuser reply type needs so [`FuseFs::with_snapshot`] can
+/// hand the error path back to the kernel without knowing which reply
+/// it holds.
+trait ReplyError: Send + 'static {
+    fn error(self, errno: Errno);
+}
+
+macro_rules! impl_reply_error {
+    ($($ty:ty),+) => {
+        $(impl ReplyError for $ty {
+            fn error(self, errno: Errno) {
+                <$ty>::error(self, errno)
+            }
+        })+
+    };
+}
+
+impl_reply_error!(ReplyEntry, ReplyAttr, ReplyDirectory);
+
+impl<C: ChunkStore + 'static> FuseFs<C> {
+    /// Run `f` against the snapshot that owns `sid`, on this thread if
+    /// the slot is already loaded and on the runtime if a lazy opener
+    /// has to run first. `op` only names the operation for the log line
+    /// when resolving fails.
+    fn with_snapshot<R, F>(&self, sid: inode::SnapshotId, op: &'static str, reply: R, f: F)
+    where
+        R: ReplyError,
+        F: FnOnce(&SnapshotEntry<C>, R) + Send + 'static,
+    {
+        match view::slot_lookup(&self.tree, sid) {
+            SlotLookup::Ready(entry) => f(&entry, reply),
+            SlotLookup::Pending(lazy) => {
+                let tree = Arc::clone(&self.tree);
+                self.rt.spawn(async move {
+                    match view::resolve(tree, lazy, SnapshotId(sid)).await {
+                        Ok(entry) => f(&entry, reply),
+                        Err(e) => {
+                            tracing::warn!(%e, op, "lazy resolve failed");
+                            reply.error(Errno::EIO);
+                        }
+                    }
+                });
+            }
+            SlotLookup::Missing => reply.error(Errno::ENOENT),
+        }
+    }
+}
+
+/// `read` can't use [`FuseFs::with_snapshot`] — it is already inside a
+/// spawned future, so it resolves the lookup it took beforehand itself.
+async fn resolve_lookup<C: ChunkStore + 'static>(
+    tree: Arc<RwLock<MountTree<C>>>,
+    lookup: SlotLookup<C>,
+    sid: inode::SnapshotId,
+    op: &'static str,
+) -> Result<Arc<SnapshotEntry<C>>, Errno> {
+    match lookup {
+        SlotLookup::Ready(entry) => Ok(entry),
+        SlotLookup::Pending(lazy) => {
+            view::resolve(tree, lazy, SnapshotId(sid))
+                .await
+                .map_err(|e| {
+                    tracing::warn!(%e, op, "lazy resolve failed");
+                    Errno::EIO
+                })
+        }
+        SlotLookup::Missing => Err(Errno::ENOENT),
+    }
+}
+
 /// Push `entries` into a `ReplyDirectory`, including `.` and `..`.
-fn emit_readdir(
-    ino: INodeNo,
-    entries: &[(INodeNo, FileType, String)],
-    offset: u64,
-    mut reply: ReplyDirectory,
-) {
+fn emit_readdir(ino: Ino, entries: &[(String, Node)], offset: u64, mut reply: ReplyDirectory) {
     // Cookie semantics: each entry is given a `next_offset` that the
     // kernel echoes back so we can resume. Skip entries whose cookie is
     // <= the offset the kernel already saw. `reply.add` returns true
     // when the buffer is full — stop adding but still call `reply.ok()`
     // so the kernel knows to come back with a higher offset instead of
     // looping on the same one.
-    let mut all: Vec<(INodeNo, FileType, &str)> = Vec::with_capacity(entries.len() + 2);
+    let mut all: Vec<(Ino, FileType, &str)> = Vec::with_capacity(entries.len() + 2);
     all.push((ino, FileType::Directory, "."));
     all.push((ino, FileType::Directory, ".."));
-    for (child_ino, kind, name) in entries {
-        all.push((*child_ino, *kind, name.as_str()));
+    for (name, node) in entries {
+        all.push((node.ino, file_type_of(node), name.as_str()));
     }
     for (i, (child_ino, kind, name)) in all.iter().enumerate() {
         let next_offset = (i + 1) as u64;
         if next_offset <= offset {
             continue;
         }
-        if reply.add(*child_ino, next_offset, *kind, name) {
+        if reply.add(INodeNo(*child_ino), next_offset, *kind, name) {
             break;
         }
     }
     reply.ok();
 }
 
-/// Resolve `(parent, name)` on a synthetic dir parent.
-fn resolve_synthetic_child<C: ChunkStore>(
-    tree: &MountTree<C>,
-    parent: INodeNo,
-    name: &str,
-) -> Option<(INodeNo, FileAttr)> {
-    let dir = tree.synthetic(parent)?;
-    let &child = dir.children.get(name)?;
-    let attr = attr_for_synthetic(tree, child).or_else(|| {
-        // Child lives inside a snapshot — only its idx==0 root makes
-        // sense to answer here (a synthetic parent's child is always
-        // either another synthetic dir or a snapshot root). Use the
-        // slot's cached creation_time if available, EPOCH otherwise.
-        let (sid, idx) = inode::unpack(child);
-        if idx != 0 {
-            return None;
-        }
-        let mtime = tree
-            .slot(sid)
-            .and_then(|s| s.creation_time)
-            .map(manifest_mtime)
-            .unwrap_or(UNIX_EPOCH);
-        Some(dir_attr(child, 0, mtime))
-    })?;
-    Some((child, attr))
+/// Symlinks are reported as regular files: `readlink` isn't implemented
+/// here, and the kernel would follow a link we can't resolve.
+fn file_type_of(node: &Node) -> FileType {
+    match node.kind {
+        NodeKind::Dir => FileType::Directory,
+        NodeKind::File { .. } | NodeKind::Symlink { .. } => FileType::RegularFile,
+    }
 }
 
-/// Resolve `(parent, name)` within a snapshot subtree.
-fn resolve_snapshot_child<C: ChunkStore>(
-    entry: &SnapshotEntry<C>,
-    parent: INodeNo,
-    name: &str,
-) -> Option<(INodeNo, FileAttr)> {
-    let (sid, idx) = inode::unpack(parent);
-    let parent_path = snapshot_path_of(entry, idx)?;
-    let child_path = if parent_path.is_empty() {
-        name.to_string()
-    } else {
-        format!("{parent_path}/{name}")
+fn attr_of(node: &Node) -> FileAttr {
+    let kind = file_type_of(node);
+    let (perm, nlink) = match &node.kind {
+        NodeKind::Dir => (0o555, 2),
+        NodeKind::File { executable } => (if *executable { 0o555 } else { 0o444 }, 1),
+        NodeKind::Symlink { .. } => (0o444, 1),
     };
-    let child_idx = entry.snapshot.index_of(&child_path)?;
-    let child_ino = inode::pack(sid, (child_idx + 1) as u64);
-    let manifest = entry.snapshot.manifest();
-    let f = manifest.files.get(child_idx)?;
-    let mtime = manifest_mtime(manifest.creation_time);
-    Some((child_ino, depot_file_attr(f, child_ino, mtime)))
-}
-
-fn attr_for_synthetic<C: ChunkStore>(tree: &MountTree<C>, ino: INodeNo) -> Option<FileAttr> {
-    let (sid, _) = inode::unpack(ino);
-    if sid != SYNTHETIC {
-        return None;
-    }
-    tree.synthetic(ino)?;
-    Some(dir_attr(ino, 0, UNIX_EPOCH))
-}
-
-fn attr_within_snapshot<C: ChunkStore>(entry: &SnapshotEntry<C>, ino: INodeNo) -> Option<FileAttr> {
-    let (_, idx) = inode::unpack(ino);
-    let manifest = entry.snapshot.manifest();
-    let mtime = manifest_mtime(manifest.creation_time);
-    if idx == 0 {
-        return Some(dir_attr(ino, 0, mtime));
-    }
-    let f = manifest.files.get(idx as usize - 1)?;
-    Some(depot_file_attr(f, ino, mtime))
-}
-
-fn depot_file_attr(f: &DepotFile, ino: INodeNo, mtime: SystemTime) -> FileAttr {
-    match f.kind {
-        FileKind::Directory => dir_attr(ino, f.size, mtime),
-        FileKind::File | FileKind::Symlink => file_attr(ino, f.size, f.executable, mtime),
-    }
-}
-
-/// Path of inode `(sid, idx)` *within its snapshot*. Empty string =
-/// snapshot root. Returns `None` if `idx` is out of range.
-fn snapshot_path_of<C: ChunkStore>(entry: &SnapshotEntry<C>, idx: u64) -> Option<String> {
-    if idx == 0 {
-        return Some(String::new());
-    }
-    let file_idx = (idx as usize).checked_sub(1)?;
-    Some(entry.snapshot.manifest().files.get(file_idx)?.path.clone())
-}
-
-fn collect_synthetic_dir<C: ChunkStore>(
-    tree: &MountTree<C>,
-    ino: INodeNo,
-) -> Option<Vec<(INodeNo, FileType, String)>> {
-    let dir = tree.synthetic(ino)?;
-    let mut out: Vec<_> = dir
-        .children
-        .iter()
-        .map(|(name, &child_ino)| (child_ino, FileType::Directory, name.clone()))
-        .collect();
-    out.sort_by(|a, b| a.2.cmp(&b.2));
-    Some(out)
-}
-
-fn collect_snapshot_dir<C: ChunkStore>(
-    entry: &SnapshotEntry<C>,
-    ino: INodeNo,
-) -> Option<Vec<(INodeNo, FileType, String)>> {
-    let (sid, idx) = inode::unpack(ino);
-    let dir_path = snapshot_path_of(entry, idx)?;
-    let entries: Vec<Entry> = entry.snapshot.list_dir(&dir_path).ok()?;
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        let child = if dir_path.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{dir_path}/{}", e.name)
-        };
-        let Some(child_idx) = entry.snapshot.index_of(&child) else {
-            continue;
-        };
-        let kind = match e.meta.kind {
-            FileKind::Directory => FileType::Directory,
-            FileKind::Symlink | FileKind::File => FileType::RegularFile,
-        };
-        let child_ino = inode::pack(sid, (child_idx + 1) as u64);
-        out.push((child_ino, kind, e.name));
-    }
-    Some(out)
-}
-
-fn dir_attr(ino: INodeNo, size: u64, mtime: SystemTime) -> FileAttr {
-    base_attr(ino, size, FileType::Directory, 0o555, 2, mtime)
-}
-
-fn file_attr(ino: INodeNo, size: u64, executable: bool, mtime: SystemTime) -> FileAttr {
-    let perm = if executable { 0o555 } else { 0o444 };
-    base_attr(ino, size, FileType::RegularFile, perm, 1, mtime)
-}
-
-fn base_attr(
-    ino: INodeNo,
-    size: u64,
-    kind: FileType,
-    perm: u16,
-    nlink: u32,
-    mtime: SystemTime,
-) -> FileAttr {
+    let mtime = UNIX_EPOCH + Duration::from_secs(u64::from(node.mtime_secs));
     FileAttr {
-        ino,
-        size,
+        ino: INodeNo(node.ino),
+        size: node.size,
         blocks: if matches!(kind, FileType::RegularFile) {
-            size.div_ceil(512)
+            node.size.div_ceil(512)
         } else {
             0
         },
@@ -519,9 +331,4 @@ fn base_attr(
         blksize: 4096,
         flags: 0,
     }
-}
-
-/// Convert a manifest's `creation_time` (Unix seconds) into a `SystemTime`.
-fn manifest_mtime(creation_time: u32) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(u64::from(creation_time))
 }

@@ -11,23 +11,27 @@
 //! 16 bits = 65 535 concurrent snapshots is generous; 48 bits of file
 //! index gives 281 T files per snapshot, which Steam will never hand us.
 
-use fuser::INodeNo;
+/// Node id in the mount tree. Deliberately a plain integer rather than
+/// a backend type: FUSE calls it an inode number, NFS a `fileid3`, and
+/// both back ends share one encoding.
+pub(crate) type Ino = u64;
 
 pub(crate) type SnapshotId = u16;
 
 pub(crate) const SYNTHETIC: SnapshotId = 0;
-pub(crate) const ROOT: INodeNo = INodeNo::ROOT;
+/// Both FUSE and NFSv3 expect the root node to be id 1.
+pub(crate) const ROOT: Ino = 1;
 
 const SNAPSHOT_SHIFT: u32 = 48;
 const INDEX_MASK: u64 = (1 << SNAPSHOT_SHIFT) - 1;
 
-pub(crate) fn pack(snapshot: SnapshotId, index: u64) -> INodeNo {
+pub(crate) fn pack(snapshot: SnapshotId, index: u64) -> Ino {
     debug_assert!(index <= INDEX_MASK, "index {index} overflows 48 bits");
-    INodeNo(((snapshot as u64) << SNAPSHOT_SHIFT) | index)
+    ((snapshot as u64) << SNAPSHOT_SHIFT) | index
 }
 
-pub(crate) fn unpack(ino: INodeNo) -> (SnapshotId, u64) {
-    ((ino.0 >> SNAPSHOT_SHIFT) as SnapshotId, ino.0 & INDEX_MASK)
+pub(crate) fn unpack(ino: Ino) -> (SnapshotId, u64) {
+    ((ino >> SNAPSHOT_SHIFT) as SnapshotId, ino & INDEX_MASK)
 }
 
 #[cfg(test)]
@@ -35,7 +39,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn root_is_synthetic_index_zero() {
+    fn root_is_synthetic_index_one() {
         assert_eq!(unpack(ROOT), (SYNTHETIC, 1));
     }
 
@@ -43,7 +47,7 @@ mod tests {
     fn roundtrip() {
         for (s, i) in [(0, 0), (0, 1), (1, 0), (1, 42), (u16::MAX, INDEX_MASK)] {
             let ino = pack(s, i);
-            assert_eq!(unpack(ino), (s, i), "ino={:#x}", ino.0);
+            assert_eq!(unpack(ino), (s, i), "ino={ino:#x}");
         }
     }
 }
