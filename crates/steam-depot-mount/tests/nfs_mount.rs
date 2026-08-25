@@ -452,3 +452,54 @@ async fn dropping_the_handle_takes_the_mount_with_it() {
     );
     guard.disarm();
 }
+
+/// Panics inside a chunk store, the way a bug in a store implementation
+/// would.
+struct PanickingChunks;
+
+impl ChunkStore for PanickingChunks {
+    async fn get(&self, _sha: ChunkHash) -> Result<Bytes, VfsError> {
+        panic!("chunk store blew up");
+    }
+}
+
+/// A panic while serving a read must reach the client as an error. NFS
+/// has no notion of "the server gave up": a reply that never comes is a
+/// read that hangs forever, and with it every process touching the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panic_while_reading_fails_the_read_instead_of_hanging() {
+    let mountpoint = temp_mountpoint("panic");
+    let mount = NfsMount::start(NfsMountConfig::new(mountpoint.clone()))
+        .await
+        .expect("mount");
+    let manifest = Manifest {
+        depot_id: 4242,
+        manifest_id: 99,
+        creation_time: CREATION_TIME,
+        size_uncompressed: 0,
+        size_compressed: 0,
+        files: vec![file("boom.bin", 1024, false, vec![chunk(1, 0, 1024)])],
+    };
+    mount
+        .add(
+            1000,
+            4242,
+            99,
+            DepotManifestStore::new(Arc::new(manifest), PanickingChunks),
+        )
+        .expect("add");
+    let guard = MountGuard::new(mountpoint.clone());
+
+    let path = mountpoint.join("1000/4242/99/boom.bin");
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || std::fs::read(&path)),
+    )
+    .await
+    .expect("the read must not hang")
+    .expect("join");
+    assert!(read.is_err(), "the read reports an error: {read:?}");
+
+    mount.unmount().await.expect("unmount");
+    guard.disarm();
+}

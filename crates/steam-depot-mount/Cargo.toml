@@ -33,6 +33,10 @@ libc = { version = "0.2.186", optional = true }
 nfsserve = { version = "0.11.0", optional = true }
 sha1 = { version = "0.11.0", optional = true }
 tracing-subscriber = { workspace = true, optional = true, features = ["env-filter"] }
+# Only the NFS back end needs this (catching a panic in a future), but
+# it rides along through reqwest either way, so gating it would be for
+# show.
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
