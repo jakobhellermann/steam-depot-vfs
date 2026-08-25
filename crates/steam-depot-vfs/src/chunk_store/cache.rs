@@ -1,8 +1,10 @@
 // TODO(ai-review): review for correctness/style
 //! Local-disk write-through cache wrapping any other [`ChunkStore`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
 use steam_vent_depot::ChunkHash;
@@ -14,13 +16,18 @@ use crate::{chunk_store::CdnChunkStore, error::Result};
 /// Write-through local-disk cache in front of another [`ChunkStore`].
 ///
 /// Chunks live at `<root>/<sha-hex>`. Misses fall through to the inner store
-/// and the resulting bytes are persisted. Concurrent misses for the same sha
-/// may both fetch — since chunks are content-addressed and each write goes
-/// through its own temporary file, this only wastes one redundant download,
-/// never corrupts the cache.
+/// and the resulting bytes are persisted.
+///
+/// One chunk is fetched once even when many callers miss on it at the same
+/// time: a mounted filesystem turns a single client read into a dozen
+/// concurrent reads of the same chunk, and fetching per read would multiply
+/// the download by that factor.
 pub struct FsCacheStore<Inner: ChunkStore = CdnChunkStore> {
     inner: Inner,
     root: PathBuf,
+    /// One lock per chunk being fetched. Entries are dropped once the
+    /// last waiter is gone, so this doesn't grow with the cache.
+    fetching: Mutex<HashMap<ChunkHash, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl<Inner: ChunkStore> FsCacheStore<Inner> {
@@ -30,7 +37,23 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
         // best-effort; the first real write will surface them with a
         // proper error path.
         let _ = std::fs::create_dir_all(&root);
-        Self { inner, root }
+        Self {
+            inner,
+            root,
+            fetching: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The lock guarding fetches of `sha`, shared with everyone else
+    /// currently interested in it.
+    fn fetch_lock(&self, sha: ChunkHash) -> Arc<tokio::sync::Mutex<()>> {
+        let mut fetching = self.fetching.lock().expect("fetching poisoned");
+        if let Some(existing) = fetching.get(&sha).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        fetching.insert(sha, Arc::downgrade(&lock));
+        lock
     }
 
     fn path_for(&self, sha: ChunkHash) -> PathBuf {
@@ -46,8 +69,16 @@ impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
             tracing::debug!(%sha, bytes = bytes.len(), "cache hit");
             return Ok(Bytes::from(bytes));
         }
-        let bytes = self.fetch_and_persist(sha, &path).await?;
-        Ok(bytes)
+        let lock = self.fetch_lock(sha);
+        let _fetching = lock.lock().await;
+        // Whoever held the lock has written the chunk by now. Checking
+        // the file rather than passing the bytes along keeps this to one
+        // lock and no result plumbing; the loser pays a disk read.
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            tracing::debug!(%sha, bytes = bytes.len(), "cache hit after waiting for a fetch");
+            return Ok(Bytes::from(bytes));
+        }
+        self.fetch_and_persist(sha, &path).await
     }
 
     #[tracing::instrument(level = "debug", name = "fs_cache.ensure", skip_all)]
@@ -59,6 +90,11 @@ impl<Inner: ChunkStore> ChunkStore for FsCacheStore<Inner> {
         // truly broken.
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             tracing::debug!(%sha, "cache hit (ensure)");
+            return Ok(());
+        }
+        let lock = self.fetch_lock(sha);
+        let _fetching = lock.lock().await;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(());
         }
         self.fetch_and_persist(sha, &path).await?;
@@ -117,7 +153,7 @@ impl<Inner: ChunkStore> FsCacheStore<Inner> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -144,6 +180,43 @@ mod tests {
         let target = std::path::Path::new("/cache/abc123");
         assert_ne!(tmp_path(target), tmp_path(target));
         assert_eq!(tmp_path(target).parent(), target.parent());
+    }
+
+    /// A mounted filesystem turns one client read into a dozen
+    /// concurrent reads of the same chunk. Fetching it once per read
+    /// would multiply the download by that factor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_misses_fetch_once() {
+        let dir = std::env::temp_dir().join(format!("fs-cache-single-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(FsCacheStore::new(
+            SlowInner {
+                fetches: Arc::clone(&fetches),
+            },
+            dir.clone(),
+        ));
+        let sha = ChunkHash([9; 20]);
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move { store.get(sha).await }));
+        }
+        for task in tasks {
+            assert_eq!(
+                task.await.expect("task").expect("get").len(),
+                CHUNK_LEN,
+                "every caller gets the whole chunk",
+            );
+        }
+        assert_eq!(
+            fetches.load(Ordering::Relaxed),
+            1,
+            "16 concurrent readers of one chunk must fetch it once",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Concurrent misses for one sha are expected (they only waste a
