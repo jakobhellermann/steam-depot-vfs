@@ -53,3 +53,7 @@ required-features = ["probe"]
 [[bin]]
 name = "nfs-live"
 required-features = ["probe"]
+
+[[bin]]
+name = "manifest-chunks"
+required-features = ["probe"]
