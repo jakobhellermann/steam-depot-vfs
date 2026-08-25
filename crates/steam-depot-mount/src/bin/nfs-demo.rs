@@ -2,7 +2,7 @@
 //! Serve a hand-built manifest over the NFS back end and keep it mounted
 //! until Ctrl-C, so the mount can be poked at from a shell.
 //!
-//! `cargo run -p steam-depot-mount --example nfs_demo --features nfs -- /tmp/depot-demo`
+//! `cargo run -p steam-depot-mount --bin nfs-demo --features nfs -- /tmp/depot-demo`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,9 +25,14 @@ impl ChunkStore for MemChunks {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let mountpoint = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/depot-demo".to_string());
@@ -87,6 +92,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("mounted at {mountpoint}/1000/4242/99 — Ctrl-C to unmount");
     tokio::signal::ctrl_c().await?;
-    mount.unmount()?;
+    mount.unmount().await?;
     Ok(())
 }
