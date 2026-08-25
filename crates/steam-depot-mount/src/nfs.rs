@@ -126,6 +126,7 @@ impl<C: ChunkStore + 'static> NFSFileSystem for NfsFs<C> {
             .files
             .get(file_idx)
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        tracing::debug!(path = %file.path, offset, count, "nfs read");
         let (path, size) = (file.path.clone(), file.size);
         // NFS clients read ahead past EOF; clamping here keeps
         // `read_into`'s "read past end of file" guard from turning that
