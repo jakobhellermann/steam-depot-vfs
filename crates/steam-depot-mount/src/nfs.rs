@@ -7,9 +7,12 @@
 //! methods are `async fn`, so lazy manifest opens are awaited in place
 //! instead of being spawned onto a runtime handle.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
@@ -89,21 +92,11 @@ impl<C: ChunkStore + 'static> NFSFileSystem for NfsFs<C> {
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
-        let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
-        let (sid, _) = inode::unpack(dirid);
-        if sid == SYNTHETIC {
-            return view::synthetic_child(&*self.tree.read(), dirid, name)
-                .map(|n| n.ino)
-                .ok_or(nfsstat3::NFS3ERR_NOENT);
-        }
-        let entry = self.snapshot_of(sid).await?;
-        view::snapshot_child(&entry, dirid, name)
-            .map(|n| n.ino)
-            .ok_or(nfsstat3::NFS3ERR_NOENT)
+        caught("lookup", self.lookup_inner(dirid, filename)).await
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
-        Ok(attr_of(&self.node(id).await?))
+        caught("getattr", async move { Ok(attr_of(&self.node(id).await?)) }).await
     }
 
     async fn read(
@@ -112,40 +105,7 @@ impl<C: ChunkStore + 'static> NFSFileSystem for NfsFs<C> {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let (sid, idx) = inode::unpack(id);
-        if sid == SYNTHETIC {
-            return Err(nfsstat3::NFS3ERR_ISDIR);
-        }
-        let Some(file_idx) = (idx as usize).checked_sub(1) else {
-            return Err(nfsstat3::NFS3ERR_ISDIR);
-        };
-        let entry = self.snapshot_of(sid).await?;
-        let file = entry
-            .snapshot
-            .manifest()
-            .files
-            .get(file_idx)
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        tracing::debug!(path = %file.path, offset, count, "nfs read");
-        let (path, size) = (file.path.clone(), file.size);
-        // NFS clients read ahead past EOF; clamping here keeps
-        // `read_into`'s "read past end of file" guard from turning that
-        // into an I/O error.
-        if offset >= size {
-            return Ok((Vec::new(), true));
-        }
-        let len = u64::from(count).min(size - offset);
-        let mut buf = Vec::with_capacity(len as usize);
-        entry
-            .snapshot
-            .read_into(&path, offset, len, &mut buf)
-            .await
-            .map_err(|e| {
-                tracing::warn!(path = %path, offset, len, %e, "read failed");
-                nfsstat3::NFS3ERR_IO
-            })?;
-        let eof = offset + buf.len() as u64 >= size;
-        Ok((buf, eof))
+        caught("read", self.read_inner(id, offset, count)).await
     }
 
     async fn readdir(
@@ -154,45 +114,25 @@ impl<C: ChunkStore + 'static> NFSFileSystem for NfsFs<C> {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let (sid, _) = inode::unpack(dirid);
-        let entries = if sid == SYNTHETIC {
-            view::synthetic_dir(&*self.tree.read(), dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?
-        } else {
-            let entry = self.snapshot_of(sid).await?;
-            view::snapshot_dir(&entry, dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?
-        };
-        // The cookie nfsserve hands back is the fileid of the last entry
-        // it emitted, so resume right after it. An unknown cookie
-        // restarts the listing rather than failing it — see the
-        // BAD_COOKIE discussion in nfsserve's readdir handler.
-        let skip = if start_after == 0 {
-            0
-        } else {
-            entries
-                .iter()
-                .position(|(_, node)| node.ino == start_after)
-                .map_or(0, |i| i + 1)
-        };
-        let page: Vec<DirEntry> = entries[skip..]
-            .iter()
-            .take(max_entries)
-            .map(|(name, node)| DirEntry {
-                fileid: node.ino,
-                name: name.as_bytes().into(),
-                attr: attr_of(node),
-            })
-            .collect();
-        let end = skip + page.len() >= entries.len();
-        Ok(ReadDirResult { entries: page, end })
+        caught(
+            "readdir",
+            self.readdir_inner(dirid, start_after, max_entries),
+        )
+        .await
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        match self.node(id).await?.kind {
-            NodeKind::Symlink { target } => Ok(target.as_bytes().into()),
-            _ => Err(nfsstat3::NFS3ERR_INVAL),
-        }
+        caught("readlink", async move {
+            match self.node(id).await?.kind {
+                NodeKind::Symlink { target } => Ok(target.as_bytes().into()),
+                _ => Err(nfsstat3::NFS3ERR_INVAL),
+            }
+        })
+        .await
     }
 
+    // Everything below is refused: the filesystem is read-only, and the
+    // client mounts it that way too.
     async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
@@ -248,6 +188,128 @@ impl<C: ChunkStore + 'static> NFSFileSystem for NfsFs<C> {
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
+    }
+}
+
+impl<C: ChunkStore + 'static> NfsFs<C> {
+    async fn lookup_inner(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+    ) -> Result<fileid3, nfsstat3> {
+        let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
+        let (sid, _) = inode::unpack(dirid);
+        if sid == SYNTHETIC {
+            return view::synthetic_child(&*self.tree.read(), dirid, name)
+                .map(|n| n.ino)
+                .ok_or(nfsstat3::NFS3ERR_NOENT);
+        }
+        let entry = self.snapshot_of(sid).await?;
+        view::snapshot_child(&entry, dirid, name)
+            .map(|n| n.ino)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)
+    }
+
+    async fn read_inner(
+        &self,
+        id: fileid3,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let (sid, idx) = inode::unpack(id);
+        if sid == SYNTHETIC {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        let Some(file_idx) = (idx as usize).checked_sub(1) else {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        };
+        let entry = self.snapshot_of(sid).await?;
+        let file = entry
+            .snapshot
+            .manifest()
+            .files
+            .get(file_idx)
+            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        tracing::debug!(path = %file.path, offset, count, "nfs read");
+        let (path, size) = (file.path.clone(), file.size);
+        // NFS clients read ahead past EOF; clamping here keeps
+        // `read_into`'s "read past end of file" guard from turning that
+        // into an I/O error.
+        if offset >= size {
+            return Ok((Vec::new(), true));
+        }
+        let len = u64::from(count).min(size - offset);
+        let mut buf = Vec::with_capacity(len as usize);
+        entry
+            .snapshot
+            .read_into(&path, offset, len, &mut buf)
+            .await
+            .map_err(|e| {
+                tracing::warn!(path = %path, offset, len, %e, "read failed");
+                nfsstat3::NFS3ERR_IO
+            })?;
+        let eof = offset + buf.len() as u64 >= size;
+        Ok((buf, eof))
+    }
+
+    async fn readdir_inner(
+        &self,
+        dirid: fileid3,
+        start_after: fileid3,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, nfsstat3> {
+        let (sid, _) = inode::unpack(dirid);
+        let entries = if sid == SYNTHETIC {
+            view::synthetic_dir(&*self.tree.read(), dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?
+        } else {
+            let entry = self.snapshot_of(sid).await?;
+            view::snapshot_dir(&entry, dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?
+        };
+        // The cookie nfsserve hands back is the fileid of the last entry
+        // it emitted, so resume right after it. An unknown cookie
+        // restarts the listing rather than failing it — see the
+        // BAD_COOKIE discussion in nfsserve's readdir handler.
+        let skip = if start_after == 0 {
+            0
+        } else {
+            entries
+                .iter()
+                .position(|(_, node)| node.ino == start_after)
+                .map_or(0, |i| i + 1)
+        };
+        let page: Vec<DirEntry> = entries[skip..]
+            .iter()
+            .take(max_entries)
+            .map(|(name, node)| DirEntry {
+                fileid: node.ino,
+                name: name.as_bytes().into(),
+                attr: attr_of(node),
+            })
+            .collect();
+        let end = skip + page.len() >= entries.len();
+        Ok(ReadDirResult { entries: page, end })
+    }
+}
+
+/// Run `fut`, turning a panic into an I/O error for the client.
+///
+/// NFS has no way to say "the server gave up": a request that never gets
+/// a reply is a read that hangs forever, and with it every process that
+/// touches the file. A panic in here — a bug in a chunk store, a
+/// poisoned lock — must therefore end up as a reply, not as silence.
+async fn caught<T, F>(op: &'static str, fut: F) -> Result<T, nfsstat3>
+where
+    F: Future<Output = Result<T, nfsstat3>>,
+{
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                op,
+                "panic while serving a request; replying with an I/O error"
+            );
+            Err(nfsstat3::NFS3ERR_IO)
+        }
     }
 }
 
