@@ -15,13 +15,17 @@
 //! module mirrors its fields with a private serde-friendly representation and
 //! converts on the way in/out.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use steam_vent_depot::{Chunk, DepotFile, FileKind, Manifest};
 
 use crate::Result;
+
+type ManifestKey = (u32, u32, u64);
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -46,14 +50,19 @@ impl CacheError {
     }
 }
 
+/// One mutex per in-flight key so concurrent callers share a fetch instead of racing the CDN.
 #[derive(Clone)]
 pub struct ManifestCache {
     root: PathBuf,
+    in_flight: Arc<Mutex<HashMap<ManifestKey, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ManifestCache {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn path_for(&self, app_id: u32, depot_id: u32, manifest_id: u64) -> PathBuf {
@@ -135,9 +144,86 @@ impl ManifestCache {
         if let Some(m) = self.load_async(app_id, depot_id, manifest_id).await? {
             return Ok(m);
         }
+
+        let key = (app_id, depot_id, manifest_id);
+        let key_lock = {
+            let mut in_flight = self.in_flight.lock().expect("in_flight poisoned");
+            Arc::clone(
+                in_flight
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _permit = key_lock.lock().await;
+
+        // Someone else may have fetched and saved it while we waited.
+        if let Some(m) = self.load_async(app_id, depot_id, manifest_id).await? {
+            return Ok(m);
+        }
         let manifest = fetch().await?;
         self.save(app_id, &manifest)?;
+        self.in_flight
+            .lock()
+            .expect("in_flight poisoned")
+            .remove(&key);
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    fn empty_manifest(depot_id: u32, manifest_id: u64) -> Manifest {
+        Manifest {
+            depot_id,
+            manifest_id,
+            creation_time: 0,
+            size_uncompressed: 0,
+            size_compressed: 0,
+            files: Vec::new(),
+        }
+    }
+
+    fn tmp_cache() -> (ManifestCache, PathBuf) {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("manifest-cache-test-{}-{n}", std::process::id()));
+        (ManifestCache::new(dir.clone()), dir)
+    }
+
+    #[tokio::test]
+    async fn concurrent_get_or_fetch_only_fetches_once() {
+        let (cache, dir) = tmp_cache();
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let fetch_count = Arc::clone(&fetch_count);
+                tokio::spawn(async move {
+                    cache
+                        .get_or_fetch(1, 2, 3, || {
+                            let fetch_count = Arc::clone(&fetch_count);
+                            async move {
+                                fetch_count.fetch_add(1, Ordering::SeqCst);
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                Ok::<_, CacheError>(empty_manifest(2, 3))
+                            }
+                        })
+                        .await
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
