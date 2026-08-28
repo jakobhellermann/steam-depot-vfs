@@ -165,10 +165,10 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            if file.linktarget.is_some() {
+            if file.linktarget().is_some() {
                 tracing::warn!(
                     path = %file.path,
-                    target = ?file.linktarget,
+                    target = ?file.linktarget(),
                     "reading symlink as regular file; link target not resolved",
                 );
             }

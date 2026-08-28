@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use steam_vent_depot::{Chunk, DepotFile, FileKind, Manifest};
+use steam_vent_depot::{Chunk, DepotFile, DepotFileKind, FileHash, Manifest};
 
 use crate::Result;
 
@@ -244,17 +244,19 @@ struct CachedFile {
     path: String,
     size: u64,
     kind: CachedFileKind,
-    executable: bool,
-    sha: Option<[u8; 20]>,
-    linktarget: Option<String>,
-    chunks: Vec<CachedChunk>,
 }
 
 #[derive(Serialize, Deserialize)]
 enum CachedFileKind {
-    File,
+    File {
+        sha: [u8; 20],
+        executable: bool,
+        chunks: Vec<CachedChunk>,
+    },
     Directory,
-    Symlink,
+    Symlink {
+        target: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -297,11 +299,7 @@ impl From<&DepotFile> for CachedFile {
         Self {
             path: f.path.clone(),
             size: f.size,
-            kind: f.kind.into(),
-            executable: f.executable,
-            sha: f.sha,
-            linktarget: f.linktarget.clone(),
-            chunks: f.chunks.iter().map(CachedChunk::from).collect(),
+            kind: (&f.kind).into(),
         }
     }
 }
@@ -312,10 +310,6 @@ impl From<CachedFile> for DepotFile {
             path: c.path,
             size: c.size,
             kind: c.kind.into(),
-            executable: c.executable,
-            sha: c.sha,
-            linktarget: c.linktarget,
-            chunks: c.chunks.into_iter().map(Chunk::from).collect(),
         }
     }
 }
@@ -344,22 +338,40 @@ impl From<CachedChunk> for Chunk {
     }
 }
 
-impl From<FileKind> for CachedFileKind {
-    fn from(k: FileKind) -> Self {
+impl From<&DepotFileKind> for CachedFileKind {
+    fn from(k: &DepotFileKind) -> Self {
         match k {
-            FileKind::File => Self::File,
-            FileKind::Directory => Self::Directory,
-            FileKind::Symlink => Self::Symlink,
+            DepotFileKind::File {
+                sha,
+                executable,
+                chunks,
+            } => Self::File {
+                sha: sha.0,
+                executable: *executable,
+                chunks: chunks.iter().map(CachedChunk::from).collect(),
+            },
+            DepotFileKind::Directory => Self::Directory,
+            DepotFileKind::Symlink { target } => Self::Symlink {
+                target: target.clone(),
+            },
         }
     }
 }
 
-impl From<CachedFileKind> for FileKind {
+impl From<CachedFileKind> for DepotFileKind {
     fn from(k: CachedFileKind) -> Self {
         match k {
-            CachedFileKind::File => Self::File,
+            CachedFileKind::File {
+                sha,
+                executable,
+                chunks,
+            } => Self::File {
+                sha: FileHash(sha),
+                executable,
+                chunks: chunks.into_iter().map(Chunk::from).collect(),
+            },
             CachedFileKind::Directory => Self::Directory,
-            CachedFileKind::Symlink => Self::Symlink,
+            CachedFileKind::Symlink { target } => Self::Symlink { target },
         }
     }
 }

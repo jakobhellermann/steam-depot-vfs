@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use steam_depot_vfs::FileKind;
+use steam_depot_vfs::FileType;
 use steam_depot_vfs::chunk_store::ChunkStore;
 
 use crate::inode::{self, Ino, SYNTHETIC};
@@ -150,7 +150,7 @@ pub(crate) fn snapshot_node<C: ChunkStore>(entry: &SnapshotEntry<C>, ino: Ino) -
     let f = manifest.files.get(idx as usize - 1)?;
     Some(Node {
         ino,
-        kind: kind_of(f.kind, f.executable, f.linktarget.as_deref()),
+        kind: kind_of(f.file_type(), f.executable(), f.linktarget()),
         size: f.size,
         mtime_secs: manifest.creation_time,
     })
@@ -187,7 +187,7 @@ pub(crate) fn snapshot_dir<C: ChunkStore>(
                 ino: inode::pack(sid, (child_idx + 1) as u64),
                 kind: kind_of(
                     e.meta.kind,
-                    manifest.files.get(child_idx).is_some_and(|f| f.executable),
+                    manifest.files.get(child_idx).is_some_and(|f| f.executable()),
                     e.meta.linktarget.as_deref(),
                 ),
                 size: e.meta.size,
@@ -214,10 +214,10 @@ pub(crate) fn path_within_snapshot<C: ChunkStore>(
 
 /// Symlinks without a target can't be represented as links, so they
 /// degrade to regular files — same as the FUSE back end does.
-fn kind_of(kind: FileKind, executable: bool, linktarget: Option<&str>) -> NodeKind {
+fn kind_of(kind: FileType, executable: bool, linktarget: Option<&str>) -> NodeKind {
     match (kind, linktarget) {
-        (FileKind::Directory, _) => NodeKind::Dir,
-        (FileKind::Symlink, Some(target)) => NodeKind::Symlink {
+        (FileType::Directory, _) => NodeKind::Dir,
+        (FileType::Symlink, Some(target)) => NodeKind::Symlink {
             target: target.to_string(),
         },
         _ => NodeKind::File { executable },

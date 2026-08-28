@@ -117,7 +117,7 @@ pub fn run(cfg: &Config, verify: bool) -> Result<()> {
         let mut fetched_chunks: u64 = 0;
         let mut unique = HashSet::new();
         for f in &manifest.files {
-            for c in &f.chunks {
+            for c in f.chunks() {
                 if !unique.insert(c.sha) {
                     continue;
                 }

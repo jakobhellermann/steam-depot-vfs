@@ -46,4 +46,4 @@ pub use error::{Result, VfsError};
 pub use manifest_cache::CacheError;
 pub use steam_vent_depot::ChunkHash;
 pub use steam_vent_depot::DepotFile;
-pub use steam_vent_depot::FileKind;
+pub use steam_vent_depot::{DepotFileKind, FileHash, FileType};

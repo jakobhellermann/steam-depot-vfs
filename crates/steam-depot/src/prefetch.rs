@@ -174,7 +174,7 @@ where
     let mut skipped: HashSet<_> = HashSet::new();
     let mut skipped_bytes: u64 = 0;
     for f in &manifest.files {
-        for c in &f.chunks {
+        for c in f.chunks() {
             if already_cached.contains(&c.sha) {
                 if skipped.insert(c.sha) {
                     skipped_bytes += c.size_compressed as u64;
