@@ -31,7 +31,7 @@ impl<A: SteamAuth> CdnChunkStore<A> {
     pub fn new(auth: Arc<A>, depot_id: u32, depot_key: LazyDepotKey, manifest: &Manifest) -> Self {
         let mut chunk_index = HashMap::new();
         for f in &manifest.files {
-            for c in &f.chunks {
+            for c in f.chunks() {
                 chunk_index.entry(c.sha).or_insert_with(|| c.clone());
             }
         }

@@ -7,7 +7,7 @@ use std::{io::Write as _, sync::Arc};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use steam_depot_vfs::{
-    DepotStore, FileKind, chunk_store::ChunkStore, fs::DepotManifestStore, session::LazyCachedAuth,
+    DepotStore, FileType, chunk_store::ChunkStore, fs::DepotManifestStore, session::LazyCachedAuth,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -89,11 +89,11 @@ fn ls(fs: &DepotManifestStore<impl ChunkStore>, path: &str) -> Result<()> {
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     for e in entries {
         let marker = match e.meta.kind {
-            FileKind::Directory => "d",
-            FileKind::Symlink => "l",
-            FileKind::File => "f",
+            FileType::Directory => "d",
+            FileType::Symlink => "l",
+            FileType::File => "f",
         };
-        let size = if matches!(e.meta.kind, FileKind::File) {
+        let size = if matches!(e.meta.kind, FileType::File) {
             human_bytes(e.meta.size)
         } else {
             "-".into()

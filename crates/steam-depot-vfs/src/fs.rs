@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use steam_vent_depot::{DepotFile, FileKind, Manifest};
+use steam_vent_depot::{DepotFile, FileType, Manifest};
 use tokio::runtime::Handle;
 
 use crate::chunk_store::ChunkStore;
@@ -16,7 +16,7 @@ use crate::chunk_store::ChunkStore;
 #[derive(Debug, Clone)]
 pub struct FileMeta {
     pub size: u64,
-    pub kind: FileKind,
+    pub kind: FileType,
     pub linktarget: Option<String>,
 }
 
@@ -127,7 +127,7 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         if path.is_empty() || path == "/" {
             return Ok(FileMeta {
                 size: 0,
-                kind: FileKind::Directory,
+                kind: FileType::Directory,
                 linktarget: None,
             });
         }
@@ -139,8 +139,8 @@ impl<C: ChunkStore> DepotManifestStore<C> {
         let f = &self.manifest.files[*idx];
         Ok(FileMeta {
             size: f.size,
-            kind: f.kind,
-            linktarget: f.linktarget.clone(),
+            kind: f.file_type(),
+            linktarget: f.linktarget().map(str::to_owned),
         })
     }
 
@@ -166,8 +166,8 @@ impl<C: ChunkStore> DepotManifestStore<C> {
                 name,
                 meta: FileMeta {
                     size: f.size,
-                    kind: f.kind,
-                    linktarget: f.linktarget.clone(),
+                    kind: f.file_type(),
+                    linktarget: f.linktarget().map(str::to_owned),
                 },
             });
         }
@@ -177,7 +177,7 @@ impl<C: ChunkStore> DepotManifestStore<C> {
     /// Read the entire file at `path`. Convenience wrapper around [`read`](Self::read).
     pub async fn read_full(&self, path: &str) -> Result<Bytes, std::io::Error> {
         let meta = self.metadata(path)?;
-        if !matches!(meta.kind, FileKind::File) {
+        if !matches!(meta.kind, FileType::File) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("'{}' is not a regular file", path),
@@ -213,7 +213,7 @@ impl<C: ChunkStore> DepotManifestStore<C> {
             .get(p)
             .ok_or_else(|| self.not_found_error(path, p))?;
         let f: &DepotFile = &self.manifest.files[idx];
-        if !matches!(f.kind, FileKind::File) {
+        if !f.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("'{}' is not a regular file", path),
@@ -232,16 +232,16 @@ impl<C: ChunkStore> DepotManifestStore<C> {
             offset,
             len = want_len,
             file_size = f.size,
-            chunks = f.chunks.len(),
+            chunks = f.chunks().len(),
             "reading file"
         );
         out.reserve(want_len);
 
         // `DepotFile::chunks` is sorted by offset (enforced upstream), so we
         // can `break` once we're past `end`.
-        debug_assert!(f.chunks.is_sorted_by_key(|c| c.offset));
+        debug_assert!(f.chunks().is_sorted_by_key(|c| c.offset));
 
-        for c in &f.chunks {
+        for c in f.chunks() {
             let c_start = c.offset;
             let c_end = c.offset + c.size_uncompressed as u64;
             if c_end <= offset {
@@ -299,13 +299,13 @@ impl<C: ChunkStore> DepotManifestStore<C> {
             .get(stripped)
             .ok_or_else(|| self.not_found_error(path, stripped))?;
         let f = &self.manifest.files[idx];
-        if !matches!(f.kind, FileKind::File) {
+        if !f.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("'{}' is not a regular file", path),
             ));
         }
-        debug_assert!(f.chunks.is_sorted_by_key(|c| c.offset));
+        debug_assert!(f.chunks().is_sorted_by_key(|c| c.offset));
         Ok(DepotFileReader {
             store: self,
             file_idx: idx,
@@ -364,7 +364,7 @@ impl<'a, C: ChunkStore> Read for DepotFileReader<'a, C> {
         // Chunks are sorted by offset and cover the file contiguously, so the
         // chunk containing `self.pos` is the last one whose offset is <= pos.
         let chunk_i = f
-            .chunks
+            .chunks()
             .partition_point(|c| c.offset <= self.pos)
             .checked_sub(1)
             .ok_or_else(|| {
@@ -373,7 +373,7 @@ impl<'a, C: ChunkStore> Read for DepotFileReader<'a, C> {
                     format!("no chunk covers offset {} in '{}'", self.pos, f.path),
                 )
             })?;
-        let chunk = &f.chunks[chunk_i];
+        let chunk = &f.chunks()[chunk_i];
         if self.pos >= chunk.offset + chunk.size_uncompressed as u64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -435,7 +435,7 @@ fn strip_leading_slash(p: &str) -> &str {
 mod tests {
     use std::sync::Arc;
 
-    use steam_vent_depot::{Chunk, ChunkHash, DepotFile, FileKind, Manifest};
+    use steam_vent_depot::{Chunk, ChunkHash, DepotFile, DepotFileKind, FileHash, Manifest};
 
     use super::*;
 
@@ -459,17 +459,17 @@ mod tests {
             files: vec![DepotFile {
                 path: "a.bin".into(),
                 size: 1024,
-                kind: FileKind::File,
-                executable: false,
-                sha: None,
-                linktarget: None,
-                chunks: vec![Chunk {
-                    sha: ChunkHash([1; 20]),
-                    crc: 0,
-                    offset: 0,
-                    size_uncompressed: 1024,
-                    size_compressed: 1024,
-                }],
+                kind: DepotFileKind::File {
+                    sha: FileHash([0; 20]),
+                    executable: false,
+                    chunks: vec![Chunk {
+                        sha: ChunkHash([1; 20]),
+                        crc: 0,
+                        offset: 0,
+                        size_uncompressed: 1024,
+                        size_compressed: 1024,
+                    }],
+                },
             }],
         };
         DepotManifestStore::new(Arc::new(manifest), ShortChunks)
