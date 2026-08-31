@@ -366,6 +366,7 @@ fn human_bytes(n: u64) -> String {
 }
 
 /// Wait for SIGINT or SIGTERM, whichever comes first.
+#[cfg(unix)]
 async fn wait_for_term_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
@@ -379,4 +380,10 @@ async fn wait_for_term_signal() {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
     }
+}
+
+/// Wait for Ctrl-C — Windows has no SIGTERM.
+#[cfg(not(unix))]
+async fn wait_for_term_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
