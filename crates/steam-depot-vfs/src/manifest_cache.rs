@@ -84,7 +84,21 @@ impl ManifestCache {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(CacheError::io("reading", path, e)),
         };
-        let cached: CachedManifest = postcard::from_bytes(&bytes)?;
+        let cached: CachedManifest = match postcard::from_bytes(&bytes) {
+            Ok(c) => c,
+            // Format changed, remove and re-fetch next time
+            Err(err) => {
+                tracing::warn!(
+                    app_id,
+                    depot_id,
+                    manifest_id,
+                    %err,
+                    "discarding stale manifest cache entry, will refetch"
+                );
+                std::fs::remove_file(&path).map_err(|e| CacheError::io("removing", path, e))?;
+                return Ok(None);
+            }
+        };
         tracing::debug!(
             app_id,
             depot_id,
