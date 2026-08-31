@@ -3,6 +3,8 @@
 //! "what is in directory N" in terms of kind, size and mtime, leaving
 //! the protocol-specific attribute structs to the back ends.
 
+#![cfg_attr(not(any(feature = "fuse", feature = "nfs")), allow(dead_code))]
+
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -187,7 +189,10 @@ pub(crate) fn snapshot_dir<C: ChunkStore>(
                 ino: inode::pack(sid, (child_idx + 1) as u64),
                 kind: kind_of(
                     e.meta.kind,
-                    manifest.files.get(child_idx).is_some_and(|f| f.executable()),
+                    manifest
+                        .files
+                        .get(child_idx)
+                        .is_some_and(|f| f.executable()),
                     e.meta.linktarget.as_deref(),
                 ),
                 size: e.meta.size,

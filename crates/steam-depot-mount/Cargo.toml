@@ -15,6 +15,8 @@ probe = ["nfs", "tokio/rt-multi-thread", "dep:tracing-subscriber", "dep:sha1"]
 # Loopback NFSv3 back end, mounted with the platform NFS client.
 # The back end does networking, so it needs tokio's net driver.
 nfs = ["dep:nfsserve", "dep:async-trait", "dep:libc", "tokio/net", "tokio/process", "tokio/time"]
+# Windows ProjFS back end. The projfs dep is windows-only (see [target]).
+projfs = ["dep:projfs"]
 
 [dependencies]
 bytes.workspace = true
@@ -37,6 +39,9 @@ tracing-subscriber = { workspace = true, optional = true, features = ["env-filte
 # it rides along through reqwest either way, so gating it would be for
 # show.
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+projfs = { path = "../projfs", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

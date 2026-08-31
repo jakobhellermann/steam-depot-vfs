@@ -1,0 +1,15 @@
+[package]
+name = "projfs"
+description = "Minimal safe-ish binding for the Windows Projected File System API"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_ProjectedFileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+] }

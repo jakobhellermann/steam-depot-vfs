@@ -23,9 +23,13 @@
 //! containers without `/dev/fuse` and Windows have no FUSE at all — so
 //! the choice is a feature rather than a `cfg(target_os)`.
 
+//! - `projfs` gives you [`ProjFsMount`], which uses the Windows Projected
+//!   File System to virtualize the tree in-process — the native fit on
+//!   Windows, where there is no FUSE.
+
 // Without a back end there is nothing to serve the tree to, so a
 // featureless build collapses to an empty crate.
-#![cfg(any(feature = "fuse", feature = "nfs"))]
+#![cfg(any(feature = "fuse", feature = "nfs", feature = "projfs"))]
 
 mod inode;
 mod tree;
@@ -41,10 +45,21 @@ mod nfs;
 #[cfg(feature = "nfs")]
 mod nfs_session;
 
+// Windows-only: the ProjFS binding doesn't exist elsewhere.
+#[cfg(all(windows, feature = "projfs"))]
+mod projfs;
+#[cfg(all(windows, feature = "projfs"))]
+mod projfs_session;
+
 #[cfg(feature = "fuse")]
 pub use session::{Mount, MountConfig, MountError};
 
 #[cfg(feature = "nfs")]
 pub use nfs_session::{NfsMount, NfsMountConfig, NfsMountError};
+
+#[cfg(all(windows, feature = "projfs"))]
+pub use ::projfs::{EnableOutcome, enable_feature_elevated};
+#[cfg(all(windows, feature = "projfs"))]
+pub use projfs_session::{ProjFsMount, ProjFsMountConfig, ProjFsMountError};
 
 pub use tree::{AddError, SnapshotId};
