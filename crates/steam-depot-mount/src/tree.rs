@@ -234,6 +234,33 @@ impl<C: ChunkStore> MountTree<C> {
         Some(entry)
     }
 
+    /// Snapshot id registered at `<app_id>/<depot_id>/<manifest_gid>`, if
+    /// any. Path-addressed lookup for the ProjFS back end.
+    #[cfg(all(windows, feature = "projfs"))]
+    pub(crate) fn find(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_gid: u64,
+    ) -> Option<inode::SnapshotId> {
+        let depot_path = format!("/{app_id}/{depot_id}");
+        let &depot_ino = self.synth_by_path.get(&depot_path)?;
+        let &gid_ino = self.children_of(depot_ino).get(&manifest_gid.to_string())?;
+        Some(inode::unpack(gid_ino).0)
+    }
+
+    /// Child names of the synthetic dir at `prefix` (`""` = root, `"/app"`,
+    /// `"/app/depot"`), or `None` if there's no such dir.
+    #[cfg(all(windows, feature = "projfs"))]
+    pub(crate) fn synthetic_children_at(&self, prefix: &str) -> Option<Vec<String>> {
+        let ino = if prefix.is_empty() {
+            inode::ROOT
+        } else {
+            *self.synth_by_path.get(prefix)?
+        };
+        Some(self.children_of(ino).keys().cloned().collect())
+    }
+
     pub fn synthetic(&self, ino: Ino) -> Option<&SyntheticDir> {
         let (sid, idx) = inode::unpack(ino);
         if sid != SYNTHETIC {

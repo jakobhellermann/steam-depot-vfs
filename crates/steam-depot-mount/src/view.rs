@@ -3,6 +3,8 @@
 //! "what is in directory N" in terms of kind, size and mtime, leaving
 //! the protocol-specific attribute structs to the back ends.
 
+#![cfg_attr(not(any(feature = "fuse", feature = "nfs")), allow(dead_code))]
+
 use std::sync::Arc;
 
 use parking_lot::RwLock;
