@@ -39,8 +39,7 @@ impl<C: ChunkStore + Send + Sync + 'static> ProjFsMount<C> {
     pub fn start(cfg: ProjFsMountConfig, rt: Handle) -> Result<Self, ProjFsMountError> {
         let tree = Arc::new(RwLock::new(MountTree::<C>::new()));
         let source = ProjFsSource::new(Arc::clone(&tree), rt);
-        let pfs =
-            projfs::ProjFS::new(&cfg.root, source).map_err(ProjFsMountError::Start)?;
+        let pfs = projfs::ProjFS::new(&cfg.root, source).map_err(ProjFsMountError::Start)?;
         tracing::info!(root = %cfg.root.display(), "ProjFS mount ready");
         Ok(Self { _pfs: pfs, tree })
     }

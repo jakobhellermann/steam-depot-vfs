@@ -7,35 +7,47 @@ use std::sync::Arc;
 use steam_vent_depot::{ChunkHash, Manifest};
 
 use crate::auth::SteamAuth;
-use crate::chunk_store::{CdnChunkStore, FsCacheStore};
+use crate::chunk_store::{CdnChunkStore, ChunkDir, FsCacheStore};
 use crate::depot_key_cache::{DepotKeyMemoryCache, LazyDepotKey};
 use crate::error::Result;
 use crate::fs::DepotManifestStore;
 use crate::manifest_cache::ManifestCache;
 
+/// Directory under the store root holding the chunk cache. Unversioned
+/// while nothing is released; once one is, a frame-format change needs
+/// a new directory name (chunk files carry no format magic), not a
+/// migration.
+pub const CHUNKS_DIR: &str = "chunks";
+
 /// Cache root that ties manifests and chunks to a single directory.
 ///
-/// One `DepotStore` is meant to outlive many [`DepotSnapshot`] instances: every
+/// One `DepotStore` is meant to outlive many snapshots: every
 /// [`open_depot_manifest`](Self::open_depot_manifest) call writes into the same chunk cache, so identical
 /// chunks across manifests/branches are downloaded at most once. Depot
 /// keys are likewise fetched at most once per process, in memory only.
 ///
 /// On-disk layout:
-/// - `<root>/manifests/<depot_id>/<gid>.postcard` — parsed manifest cache.
-/// - `<root>/chunks/<sha-hex>`                    — chunk content cache.
+/// - `<root>/manifests/<app_id>/<depot_id>/<gid>.postcard` — parsed manifest cache.
+/// - `<root>/chunks/<sha-hex>` — chunk frames, see [`FsCacheStore`].
 pub struct DepotStore {
     root: PathBuf,
     manifests: ManifestCache,
     depot_keys: DepotKeyMemoryCache,
+    /// Shared chunk-cache state. Every snapshot opened from this store
+    /// is built [`over`](FsCacheStore::over) the same one: chunks are
+    /// decoded and fetched once per store, not once per snapshot.
+    chunks: Arc<ChunkDir>,
 }
 
 impl DepotStore {
     pub fn new(root: PathBuf) -> Self {
         let manifests = ManifestCache::new(root.join("manifests"));
+        let chunks = Arc::new(ChunkDir::new(root.join(CHUNKS_DIR)));
         Self {
             root,
             manifests,
             depot_keys: DepotKeyMemoryCache::new(),
+            chunks,
         }
     }
 
@@ -57,7 +69,7 @@ impl DepotStore {
     }
 
     /// Like [`open_depot_manifest`](Self::open_depot_manifest), but lets the
-    /// caller insert an additional [`ChunkStore`] layer between
+    /// caller insert an additional [`ChunkStore`](crate::chunk_store::ChunkStore) layer between
     /// [`CdnChunkStore`] (network) and [`FsCacheStore`] (local disk). The
     /// closure receives the freshly-constructed CDN store and returns the
     /// wrapped store; the result is then wrapped by `FsCacheStore` as
@@ -87,7 +99,7 @@ impl DepotStore {
         let manifest = Arc::new(manifest);
         let cdn_store = CdnChunkStore::new(Arc::clone(&auth), depot_id, depot_key, &manifest);
         let wrapped = wrap_cdn(cdn_store);
-        let chunks = FsCacheStore::new(wrapped, self.root.join("chunks"));
+        let chunks = FsCacheStore::over(Arc::clone(&self.chunks), wrapped);
         Ok(DepotManifestStore::new(manifest, chunks))
     }
 
@@ -142,7 +154,7 @@ impl DepotStore {
     /// Root directory of the on-disk chunk cache. Useful for stats /
     /// cache management tools.
     pub fn chunks_root(&self) -> PathBuf {
-        self.root.join("chunks")
+        self.chunks.root().to_path_buf()
     }
 
     /// Root directory of the on-disk manifest postcard cache. Layout

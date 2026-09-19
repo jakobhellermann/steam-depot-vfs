@@ -11,9 +11,9 @@ mod verify;
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
