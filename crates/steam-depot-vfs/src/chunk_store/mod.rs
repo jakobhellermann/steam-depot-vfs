@@ -18,7 +18,7 @@ use crate::error::Result;
 pub mod cache;
 pub mod cdn;
 
-pub use cache::FsCacheStore;
+pub use cache::{ChunkDir, FsCacheStore, ZSTD_LEVEL, decode_frame, encode_frame};
 pub use cdn::CdnChunkStore;
 
 /// Source of decrypted + decompressed chunk bytes, keyed by SHA-1.

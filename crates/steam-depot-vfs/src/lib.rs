@@ -1,4 +1,5 @@
 // TODO(ai-review): review for correctness/style
+#![forbid(unsafe_code)]
 //! Programmatic, file-system-shaped access to a Steam depot manifest, with
 //! transparent local caching of manifests and chunks.
 //!
