@@ -26,7 +26,7 @@ use steam_depot_vfs::fs::DepotManifestStore;
 use tokio::task::JoinHandle;
 
 use crate::nfs::NfsFs;
-use crate::tree::{AddError, MountTree, Opener, OpenerFuture, SnapshotId};
+use crate::tree::{self, AddError, MountTree, Placement, SnapshotId};
 
 /// How long to wait for the kernel to let go of a forced-out mount
 /// before giving up on reusing the mountpoint.
@@ -135,10 +135,52 @@ impl<C: ChunkStore + Send + Sync + 'static> NfsMount<C> {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<DepotManifestStore<C>, std::io::Error>> + Send + 'static,
     {
-        let opener: Opener<C> = Arc::new(move || -> OpenerFuture<C> { Box::pin(opener()) });
-        self.tree
-            .write()
-            .add_lazy(app_id, depot_id, manifest_gid, opener, creation_time)
+        self.tree.write().add_lazy(
+            app_id,
+            depot_id,
+            manifest_gid,
+            tree::opener(opener),
+            creation_time,
+            Placement::IDS,
+        )
+    }
+
+    /// Register a manifest like `add_lazy`, but under
+    /// `/<app_name>/<depot_id>/<name>`. `app_name` is called when this is
+    /// the app's first snapshot, to name its dir (`None`: the app id).
+    /// `namer` names the snapshot dir when its depot dir is first listed or
+    /// looked up in (`Ok(None)`: the manifest gid); an error fails that
+    /// operation and the next one retries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_lazy_named<F, Fut, N, NFut>(
+        &self,
+        app_id: u32,
+        app_name: impl FnOnce() -> Option<String>,
+        depot_id: u32,
+        manifest_gid: u64,
+        opener: F,
+        namer: N,
+        creation_time: Option<u32>,
+    ) -> Result<SnapshotId, AddError>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<DepotManifestStore<C>, std::io::Error>> + Send + 'static,
+        N: Fn() -> NFut + Send + Sync + 'static,
+        NFut: Future<Output = Result<Option<String>, std::io::Error>> + Send + 'static,
+    {
+        // outside the write lock, as it may do I/O
+        let app_name = (!self.tree.read().has_app(app_id)).then(app_name).flatten();
+        self.tree.write().add_lazy(
+            app_id,
+            depot_id,
+            manifest_gid,
+            tree::opener(opener),
+            creation_time,
+            Placement {
+                app_name,
+                namer: Some(tree::namer(namer)),
+            },
+        )
     }
 
     pub fn remove(&self, id: SnapshotId) -> bool {

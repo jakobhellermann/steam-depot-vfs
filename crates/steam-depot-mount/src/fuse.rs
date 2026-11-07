@@ -48,9 +48,20 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         let parent = parent.0;
         let (sid, _) = inode::unpack(parent);
         if sid == SYNTHETIC {
-            // Synthetic dirs are fully described by the tree itself.
-            match view::synthetic_child(&self.tree.read(), parent, name) {
+            let found = view::synthetic_child(&self.tree.read(), parent, name);
+            match found {
                 Some(node) => reply.entry(&TTL, &attr_of(&node), Generation(0)),
+                None if view::needs_naming(&self.tree, parent) => {
+                    let name = name.to_string();
+                    self.after_naming(
+                        parent,
+                        reply,
+                        move |tree, reply| match view::synthetic_child(tree, parent, &name) {
+                            Some(node) => reply.entry(&TTL, &attr_of(&node), Generation(0)),
+                            None => reply.error(Errno::ENOENT),
+                        },
+                    );
+                }
                 None => reply.error(Errno::ENOENT),
             }
             return;
@@ -119,9 +130,16 @@ impl<C: ChunkStore + 'static> Filesystem for FuseFs<C> {
         let ino = ino.0;
         let (sid, _) = inode::unpack(ino);
         if sid == SYNTHETIC {
-            match view::synthetic_dir(&self.tree.read(), ino) {
+            let list = move |tree: &MountTree<C>, reply: ReplyDirectory| match view::synthetic_dir(
+                tree, ino,
+            ) {
                 Some(entries) => emit_readdir(ino, &entries, offset, reply),
                 None => reply.error(Errno::ENOENT),
+            };
+            if view::needs_naming(&self.tree, ino) {
+                self.after_naming(ino, reply, list);
+            } else {
+                list(&self.tree.read(), reply);
             }
             return;
         }
@@ -217,6 +235,25 @@ macro_rules! impl_reply_error {
 impl_reply_error!(ReplyEntry, ReplyAttr, ReplyDirectory);
 
 impl<C: ChunkStore + 'static> FuseFs<C> {
+    /// Name synthetic dir `dir`'s unnamed snapshots on the runtime, then
+    /// run `f` against the tree.
+    fn after_naming<R, F>(&self, dir: Ino, reply: R, f: F)
+    where
+        R: ReplyError,
+        F: FnOnce(&MountTree<C>, R) + Send + 'static,
+    {
+        let tree = Arc::clone(&self.tree);
+        self.rt.spawn(async move {
+            match view::ensure_named(&tree, dir).await {
+                Ok(()) => f(&tree.read(), reply),
+                Err(e) => {
+                    tracing::error!(%e, "naming snapshots failed");
+                    reply.error(Errno::EIO);
+                }
+            }
+        });
+    }
+
     /// Run `f` against the snapshot that owns `sid`, on this thread if
     /// the slot is already loaded and on the runtime if a lazy opener
     /// has to run first. `op` only names the operation for the log line

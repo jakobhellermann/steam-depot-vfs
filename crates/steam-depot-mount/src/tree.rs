@@ -3,14 +3,19 @@
 //!
 //! See [`crate::inode`] for the inode encoding. The tree owns:
 //!
-//! - A vector of [`SyntheticDir`]s for the root, app-id dirs, and
-//!   depot-id dirs. Their inodes are `(SYNTHETIC, slot_index)`.
+//! - A vector of [`SyntheticDir`]s for the root, app dirs, and depot
+//!   dirs. Their inodes are `(SYNTHETIC, slot_index)`. App and depot dirs
+//!   are keyed by id; their names are display only.
 //! - A slot map indexed by snapshot id. Each slot is either
 //!   [`SlotState::Pending`] (registered lazily via [`MountTree::add_lazy`]
 //!   but not yet resolved) or [`SlotState::Ready`] (snapshot is loaded
 //!   and usable). Removing a slot leaves it as `None` — the id is never
 //!   reused, so stale FUSE handles cleanly return `ENOENT` instead of
 //!   accidentally hitting a fresh snapshot.
+//!
+//! A snapshot registered with a [`Namer`] stays out of its depot dir until
+//! the dir is first listed or looked up in; then all of the dir's unnamed
+//! snapshots are named at once, and the names hold for the mount's lifetime.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -35,6 +40,29 @@ pub type OpenerFuture<C> =
 
 pub(crate) type Opener<C> = Arc<dyn Fn() -> OpenerFuture<C> + Send + Sync>;
 
+/// Future returned by a [`Namer`]: the snapshot dir's display name, or
+/// `None` to name it by its manifest gid.
+pub type NamerFuture = Pin<Box<dyn Future<Output = Result<Option<String>, std::io::Error>> + Send>>;
+
+pub(crate) type Namer = Arc<dyn Fn() -> NamerFuture + Send + Sync>;
+
+pub(crate) fn opener<C, F, Fut>(f: F) -> Opener<C>
+where
+    C: ChunkStore,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<DepotManifestStore<C>, std::io::Error>> + Send + 'static,
+{
+    Arc::new(move || -> OpenerFuture<C> { Box::pin(f()) })
+}
+
+pub(crate) fn namer<F, Fut>(f: F) -> Namer
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Option<String>, std::io::Error>> + Send + 'static,
+{
+    Arc::new(move || -> NamerFuture { Box::pin(f()) })
+}
+
 /// Lazy slot contents: the opener that loads the manifest on demand and
 /// a `OnceCell` so concurrent first-lookups coalesce on a single call.
 pub(crate) struct LazyEntry<C: ChunkStore> {
@@ -51,6 +79,8 @@ pub(crate) struct Slot<C: ChunkStore> {
     pub app_id: u32,
     pub depot_id: u32,
     pub manifest_gid: u64,
+    /// The depot dir this snapshot lives in.
+    pub parent: Ino,
     pub state: SlotState<C>,
     /// Manifest `creation_time` (Unix seconds). `None` until the snapshot
     /// is resolved — lets `getattr` on the `<gid>` root answer without
@@ -63,9 +93,9 @@ pub(crate) struct MountTree<C: ChunkStore> {
     /// Index 1 is the root. Slot 0 is unused (kept so indices line up
     /// with [`inode::ROOT`]).
     synthetic: Vec<SyntheticDir>,
-    /// Map from "/app_id" or "/app_id/depot_id" path to the synthetic
-    /// dir representing it. Used by [`MountTree::ensure_synthetic`].
-    synth_by_path: HashMap<String, Ino>,
+    app_dirs: HashMap<u32, Ino>,
+    depot_dirs: HashMap<(u32, u32), Ino>,
+    by_key: HashMap<(u32, u32, u64), inode::SnapshotId>,
     /// Indexed by `SnapshotId.0`. Slot 0 is unused (snapshot ids start
     /// at 1 so `(synthetic, *)` and `(snapshot 1, *)` are distinct).
     ///
@@ -77,12 +107,22 @@ pub(crate) struct MountTree<C: ChunkStore> {
 
 /// A synthetic directory in the mount prefix.
 pub(crate) struct SyntheticDir {
-    /// Parent inode. None only for the root.
-    pub parent: Option<Ino>,
-    /// Display name for this entry, e.g. "1030300".
-    pub name: String,
     /// Children indexed by name. Values are inodes.
     pub children: HashMap<String, Ino>,
+    /// Snapshots registered here that have no name yet.
+    pub unnamed: Vec<(inode::SnapshotId, Namer)>,
+    /// Held for a naming pass so concurrent listings run the namers once.
+    pub naming: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl SyntheticDir {
+    fn new() -> Self {
+        Self {
+            children: HashMap::new(),
+            unnamed: Vec::new(),
+            naming: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
 }
 
 /// Loaded contents of a mounted manifest. The owning [`Slot`] carries
@@ -92,24 +132,37 @@ pub(crate) struct SnapshotEntry<C: ChunkStore> {
     pub snapshot: DepotManifestStore<C>,
 }
 
+/// An unnamed snapshot of a depot dir, as handed to a naming pass.
+pub(crate) struct PendingName {
+    pub sid: inode::SnapshotId,
+    pub manifest_gid: u64,
+    pub creation_time: Option<u32>,
+    pub namer: Namer,
+}
+
+/// Where a registration places its snapshot.
+pub(crate) struct Placement {
+    /// Name of the app dir if it doesn't exist yet; the app id otherwise.
+    pub app_name: Option<String>,
+    /// Names the snapshot dir on first listing; the manifest gid otherwise.
+    pub namer: Option<Namer>,
+}
+
+impl Placement {
+    pub(crate) const IDS: Placement = Placement {
+        app_name: None,
+        namer: None,
+    };
+}
+
 impl<C: ChunkStore> MountTree<C> {
     pub fn new() -> Self {
-        let mut synthetic = Vec::with_capacity(4);
-        // Slot 0: placeholder so slot indices map to node ids.
-        synthetic.push(SyntheticDir {
-            parent: None,
-            name: String::new(),
-            children: HashMap::new(),
-        });
-        // Slot 1: the root.
-        synthetic.push(SyntheticDir {
-            parent: None,
-            name: String::new(),
-            children: HashMap::new(),
-        });
         Self {
-            synthetic,
-            synth_by_path: HashMap::new(),
+            // Slot 0: placeholder so slot indices map to node ids. Slot 1: the root.
+            synthetic: vec![SyntheticDir::new(), SyntheticDir::new()],
+            app_dirs: HashMap::new(),
+            depot_dirs: HashMap::new(),
+            by_key: HashMap::new(),
             // Slot 0: placeholder so `SnapshotId(0)` is invalid and
             // `(SYNTHETIC, *)` doesn't alias snapshot 0.
             slots: vec![None],
@@ -127,21 +180,23 @@ impl<C: ChunkStore> MountTree<C> {
         manifest_gid: u64,
         snapshot: DepotManifestStore<C>,
     ) -> Result<SnapshotId, AddError> {
-        let id = self.reserve_slot(
+        let creation_time = Some(snapshot.manifest().creation_time);
+        let state = SlotState::Ready(Arc::new(SnapshotEntry { snapshot }));
+        self.reserve_slot(
             app_id,
             depot_id,
             manifest_gid,
-            |entry| SlotState::Ready(Arc::new(entry(snapshot))),
-            None,
-        )?;
-        Ok(id)
+            state,
+            creation_time,
+            Placement::IDS,
+        )
     }
 
-    /// Register a manifest gid under `/<app_id>/<depot_id>/<manifest_gid>`
-    /// without loading it. The first FUSE operation that needs the
-    /// manifest contents calls `opener` (via a `OnceCell` so concurrent
-    /// callers coalesce) and the result is cached for the lifetime of
-    /// the slot.
+    /// Register a manifest without loading it. The first FUSE operation
+    /// that needs the manifest contents calls `opener` (via a `OnceCell`
+    /// so concurrent callers coalesce) and the result is cached for the
+    /// lifetime of the slot. `creation_time` preseeds the snapshot root's
+    /// mtime, e.g. from a cached manifest.
     pub fn add_lazy(
         &mut self,
         app_id: u32,
@@ -149,47 +204,38 @@ impl<C: ChunkStore> MountTree<C> {
         manifest_gid: u64,
         opener: Opener<C>,
         creation_time: Option<u32>,
+        placement: Placement,
     ) -> Result<SnapshotId, AddError> {
-        let lazy = Arc::new(LazyEntry {
+        let state = SlotState::Pending(Arc::new(LazyEntry {
             opener,
             cell: Arc::new(OnceCell::new()),
-        });
+        }));
         self.reserve_slot(
             app_id,
             depot_id,
             manifest_gid,
-            |_| SlotState::Pending(lazy),
+            state,
             creation_time,
+            placement,
         )
     }
 
-    /// Common path for [`add`] and [`add_lazy`]: ensures the synthetic
-    /// dirs, picks a fresh snapshot id, and inserts the slot. `build`
-    /// receives a constructor for `SnapshotEntry` (used only by the
-    /// eager `add`) — keeping it in a closure means lazy registrations
-    /// don't have to materialise a snapshot they don't have yet.
-    /// `creation_time_hint` lets lazy registrations preseed the slot's
-    /// mtime from e.g. a cached manifest, so `<gid>` getattr returns
-    /// the real release date even before the manifest is opened.
     fn reserve_slot(
         &mut self,
         app_id: u32,
         depot_id: u32,
         manifest_gid: u64,
-        build: impl FnOnce(&dyn Fn(DepotManifestStore<C>) -> SnapshotEntry<C>) -> SlotState<C>,
-        creation_time_hint: Option<u32>,
+        state: SlotState<C>,
+        creation_time: Option<u32>,
+        placement: Placement,
     ) -> Result<SnapshotId, AddError> {
-        let app_dir = self.ensure_synthetic(inode::ROOT, app_id.to_string());
-        let depot_dir = self.ensure_synthetic(app_dir, depot_id.to_string());
-        let gid_name = manifest_gid.to_string();
-        if self.children_of(depot_dir).contains_key(&gid_name) {
+        if self.by_key.contains_key(&(app_id, depot_id, manifest_gid)) {
             return Err(AddError::AlreadyMounted {
                 app_id,
                 depot_id,
                 manifest_gid,
             });
         }
-
         let next_id: u32 = self
             .slots
             .len()
@@ -199,22 +245,46 @@ impl<C: ChunkStore> MountTree<C> {
             return Err(AddError::TooManySnapshots);
         }
         let id = inode::SnapshotId::try_from(next_id).unwrap();
-        let make_entry = |snapshot: DepotManifestStore<C>| SnapshotEntry { snapshot };
-        let state = build(&make_entry);
-        let creation_time = match &state {
-            SlotState::Ready(entry) => Some(entry.snapshot.manifest().creation_time),
-            SlotState::Pending(_) => creation_time_hint,
+
+        let app_dir = match self.app_dirs.get(&app_id) {
+            Some(&ino) => ino,
+            None => {
+                let name = placement
+                    .app_name
+                    .as_deref()
+                    .and_then(sanitize_name)
+                    .unwrap_or_else(|| app_id.to_string());
+                let ino = self.new_synthetic(inode::ROOT, &name);
+                self.app_dirs.insert(app_id, ino);
+                ino
+            }
         };
+        let depot_dir = match self.depot_dirs.get(&(app_id, depot_id)) {
+            Some(&ino) => ino,
+            None => {
+                let ino = self.new_synthetic(app_dir, &depot_id.to_string());
+                self.depot_dirs.insert((app_id, depot_id), ino);
+                ino
+            }
+        };
+
         self.slots.push(Some(Arc::new(Slot {
             app_id,
             depot_id,
             manifest_gid,
+            parent: depot_dir,
             state,
             creation_time,
         })));
-        let snapshot_root = inode::pack(id, 0);
-        self.children_of_mut(depot_dir)
-            .insert(gid_name, snapshot_root);
+        self.by_key.insert((app_id, depot_id, manifest_gid), id);
+        match placement.namer {
+            Some(namer) => self.dir_mut(depot_dir).unnamed.push((id, namer)),
+            None => {
+                let name = unique_name(self.children_of(depot_dir), &manifest_gid.to_string());
+                self.children_of_mut(depot_dir)
+                    .insert(name, inode::pack(id, 0));
+            }
+        }
         Ok(SnapshotId(id))
     }
 
@@ -224,41 +294,17 @@ impl<C: ChunkStore> MountTree<C> {
     pub fn remove(&mut self, id: SnapshotId) -> Option<Arc<Slot<C>>> {
         let slot = self.slots.get_mut(id.0 as usize)?;
         let entry = slot.take()?;
-        // Detach from the parent depot dir so it stops appearing in
-        // readdir. We don't shrink the depot dir or its ancestors.
-        let depot_path = format!("/{}/{}", entry.app_id, entry.depot_id);
-        if let Some(&depot_ino) = self.synth_by_path.get(&depot_path) {
-            self.children_of_mut(depot_ino)
-                .remove(&entry.manifest_gid.to_string());
-        }
+        self.by_key
+            .remove(&(entry.app_id, entry.depot_id, entry.manifest_gid));
+        let root = inode::pack(id.0, 0);
+        let dir = self.dir_mut(entry.parent);
+        dir.children.retain(|_, &mut ino| ino != root);
+        dir.unnamed.retain(|&(sid, _)| sid != id.0);
         Some(entry)
     }
 
-    /// Snapshot id registered at `<app_id>/<depot_id>/<manifest_gid>`, if
-    /// any. Path-addressed lookup for the ProjFS back end.
-    #[cfg(all(windows, feature = "projfs"))]
-    pub(crate) fn find(
-        &self,
-        app_id: u32,
-        depot_id: u32,
-        manifest_gid: u64,
-    ) -> Option<inode::SnapshotId> {
-        let depot_path = format!("/{app_id}/{depot_id}");
-        let &depot_ino = self.synth_by_path.get(&depot_path)?;
-        let &gid_ino = self.children_of(depot_ino).get(&manifest_gid.to_string())?;
-        Some(inode::unpack(gid_ino).0)
-    }
-
-    /// Child names of the synthetic dir at `prefix` (`""` = root, `"/app"`,
-    /// `"/app/depot"`), or `None` if there's no such dir.
-    #[cfg(all(windows, feature = "projfs"))]
-    pub(crate) fn synthetic_children_at(&self, prefix: &str) -> Option<Vec<String>> {
-        let ino = if prefix.is_empty() {
-            inode::ROOT
-        } else {
-            *self.synth_by_path.get(prefix)?
-        };
-        Some(self.children_of(ino).keys().cloned().collect())
+    pub fn has_app(&self, app_id: u32) -> bool {
+        self.app_dirs.contains_key(&app_id)
     }
 
     pub fn synthetic(&self, ino: Ino) -> Option<&SyntheticDir> {
@@ -293,31 +339,61 @@ impl<C: ChunkStore> MountTree<C> {
             app_id: slot.app_id,
             depot_id: slot.depot_id,
             manifest_gid: slot.manifest_gid,
+            parent: slot.parent,
             state: SlotState::Ready(entry),
             creation_time: Some(creation_time),
         });
     }
 
-    fn ensure_synthetic(&mut self, parent: Ino, name: String) -> Ino {
-        if let Some(&existing) = self.children_of(parent).get(&name) {
-            return existing;
+    /// The unnamed snapshots of synthetic dir `dir`.
+    pub fn pending_names(&self, dir: Ino) -> Vec<PendingName> {
+        let Some(d) = self.synthetic(dir) else {
+            return Vec::new();
+        };
+        d.unnamed
+            .iter()
+            .filter_map(|(sid, namer)| {
+                let slot = self.slot(*sid)?;
+                Some(PendingName {
+                    sid: *sid,
+                    manifest_gid: slot.manifest_gid,
+                    creation_time: slot.creation_time,
+                    namer: Arc::clone(namer),
+                })
+            })
+            .collect()
+    }
+
+    /// Give each of `named` its dir entry in `dir`. Snapshots sharing a
+    /// name get `<name> (2)`, `(3)`, … with the oldest keeping the plain one;
+    /// a later batch never takes a name an earlier one already holds.
+    pub fn assign_names(&mut self, dir: Ino, mut named: Vec<(PendingName, String)>) {
+        named.sort_by_key(|(p, _)| (p.creation_time.is_none(), p.creation_time, p.manifest_gid));
+        let d = self.dir_mut(dir);
+        for (pending, name) in named {
+            // removed while its namer ran
+            let Some(i) = d.unnamed.iter().position(|&(sid, _)| sid == pending.sid) else {
+                continue;
+            };
+            d.unnamed.swap_remove(i);
+            let name = unique_name(&d.children, &name);
+            d.children.insert(name, inode::pack(pending.sid, 0));
         }
+    }
+
+    fn new_synthetic(&mut self, parent: Ino, name: &str) -> Ino {
         let slot = self.synthetic.len();
         let ino = inode::pack(SYNTHETIC, slot as u64);
-        let parent_path = self.path_of_synthetic(parent);
-        let path = if parent_path.is_empty() {
-            format!("/{name}")
-        } else {
-            format!("{parent_path}/{name}")
-        };
-        self.synthetic.push(SyntheticDir {
-            parent: Some(parent),
-            name: name.clone(),
-            children: HashMap::new(),
-        });
-        self.synth_by_path.insert(path, ino);
+        self.synthetic.push(SyntheticDir::new());
+        let name = unique_name(self.children_of(parent), name);
         self.children_of_mut(parent).insert(name, ino);
         ino
+    }
+
+    fn dir_mut(&mut self, ino: Ino) -> &mut SyntheticDir {
+        let (sid, idx) = inode::unpack(ino);
+        debug_assert_eq!(sid, SYNTHETIC, "dir_mut called with non-synthetic ino");
+        &mut self.synthetic[idx as usize]
     }
 
     fn children_of(&self, ino: Ino) -> &HashMap<String, Ino> {
@@ -327,26 +403,37 @@ impl<C: ChunkStore> MountTree<C> {
     }
 
     fn children_of_mut(&mut self, ino: Ino) -> &mut HashMap<String, Ino> {
-        let (sid, idx) = inode::unpack(ino);
-        debug_assert_eq!(
-            sid, SYNTHETIC,
-            "children_of_mut called with non-synthetic ino"
-        );
-        &mut self.synthetic[idx as usize].children
+        &mut self.dir_mut(ino).children
     }
+}
 
-    fn path_of_synthetic(&self, ino: Ino) -> String {
-        if ino == inode::ROOT {
-            return String::new();
-        }
-        let dir = &self.synthetic[inode::unpack(ino).1 as usize];
-        let parent = dir.parent.expect("non-root synthetic has parent");
-        let parent_path = self.path_of_synthetic(parent);
-        if parent_path.is_empty() {
-            format!("/{}", dir.name)
-        } else {
-            format!("{parent_path}/{}", dir.name)
-        }
+/// `base`, or the first free `base (n)` for n ≥ 2.
+fn unique_name(taken: &HashMap<String, Ino>, base: &str) -> String {
+    if !taken.contains_key(base) {
+        return base.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{base} ({n})"))
+        .find(|name| !taken.contains_key(name))
+        .expect("unbounded range")
+}
+
+/// `name` as a path component valid on every back end's platform, or
+/// `None` if nothing usable is left.
+pub(crate) fn sanitize_name(name: &str) -> Option<String> {
+    let replaced: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    // Windows drops trailing dots and spaces from path components.
+    let trimmed = replaced.trim_start().trim_end_matches([' ', '.']);
+    match trimmed {
+        "" | "." | ".." => None,
+        name => Some(name.to_owned()),
     }
 }
 

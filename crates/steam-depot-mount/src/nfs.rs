@@ -50,6 +50,13 @@ impl<C: ChunkStore + 'static> NfsFs<C> {
         }
     }
 
+    async fn ensure_named(&self, dir: fileid3) -> Result<(), nfsstat3> {
+        view::ensure_named(&self.tree, dir).await.map_err(|e| {
+            tracing::error!(%e, "naming snapshots failed");
+            nfsstat3::NFS3ERR_IO
+        })
+    }
+
     async fn node(&self, id: fileid3) -> Result<Node, nfsstat3> {
         let (sid, idx) = inode::unpack(id);
         if sid == SYNTHETIC {
@@ -207,9 +214,14 @@ impl<C: ChunkStore + 'static> NfsFs<C> {
         let name = std::str::from_utf8(&filename.0).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
         let (sid, _) = inode::unpack(dirid);
         if sid == SYNTHETIC {
-            return view::synthetic_child(&*self.tree.read(), dirid, name)
-                .map(|n| n.ino)
-                .ok_or(nfsstat3::NFS3ERR_NOENT);
+            let found = view::synthetic_child(&*self.tree.read(), dirid, name);
+            if found.is_none() && view::needs_naming(&self.tree, dirid) {
+                self.ensure_named(dirid).await?;
+                return view::synthetic_child(&*self.tree.read(), dirid, name)
+                    .map(|n| n.ino)
+                    .ok_or(nfsstat3::NFS3ERR_NOENT);
+            }
+            return found.map(|n| n.ino).ok_or(nfsstat3::NFS3ERR_NOENT);
         }
         let entry = self.snapshot_of(sid).await?;
         view::snapshot_child(&entry, dirid, name)
@@ -267,6 +279,9 @@ impl<C: ChunkStore + 'static> NfsFs<C> {
     ) -> Result<ReadDirResult, nfsstat3> {
         let (sid, _) = inode::unpack(dirid);
         let entries = if sid == SYNTHETIC {
+            if view::needs_naming(&self.tree, dirid) {
+                self.ensure_named(dirid).await?;
+            }
             view::synthetic_dir(&*self.tree.read(), dirid).ok_or(nfsstat3::NFS3ERR_NOENT)?
         } else {
             let entry = self.snapshot_of(sid).await?;

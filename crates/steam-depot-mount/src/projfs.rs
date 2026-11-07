@@ -1,13 +1,7 @@
-//! [`projfs::Filesystem`] over a [`MountTree`]. Path layout, by number of
-//! components (ProjFS hands out `\`-paths; `DepotManifestStore` wants
-//! `/`-paths):
-//!
-//! ```text
-//! []                        app ids  (synthetic children of the root)
-//! [app]                     depot ids
-//! [app, depot]              manifest gids
-//! [app, depot, gid, rest…]  file/dir `rest` inside that snapshot
-//! ```
+//! [`projfs::Filesystem`] over a [`MountTree`]. A path walks the synthetic
+//! dirs (root, app, depot) by name until it reaches a snapshot root; the
+//! components after that are the path inside the snapshot. ProjFS hands
+//! out `\`-paths; `DepotManifestStore` wants `/`-paths.
 
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -19,6 +13,7 @@ use steam_depot_vfs::chunk_store::ChunkStore;
 use steam_depot_vfs::fs::FileMeta;
 use tokio::runtime::Handle;
 
+use crate::inode::{self, Ino, SYNTHETIC};
 use crate::tree::{MountTree, SnapshotEntry, SnapshotId};
 use crate::view::{self, SlotLookup};
 
@@ -27,16 +22,59 @@ pub(crate) struct ProjFsSource<C: ChunkStore + 'static> {
     handle: Handle,
 }
 
+/// Where a path lands in the tree.
+enum Located {
+    Synthetic(Ino),
+    /// A snapshot, with the path inside it (`""` for its root).
+    Snapshot(inode::SnapshotId, String),
+}
+
 impl<C: ChunkStore + 'static> ProjFsSource<C> {
     pub(crate) fn new(tree: Arc<RwLock<MountTree<C>>>, handle: Handle) -> Self {
         Self { tree, handle }
     }
 
-    /// Resolve the snapshot at `<app>/<depot>/<gid>`, driving a lazy opener
-    /// on first access. `block_on` is safe: ProjFS callbacks run on their
-    /// own worker threads, never a tokio one.
-    fn resolve(&self, app: u32, depot: u32, gid: u64) -> Option<Arc<SnapshotEntry<C>>> {
-        let sid = self.tree.read().find(app, depot, gid)?;
+    /// Walk `comps` from the root, naming a synthetic dir's snapshots when
+    /// a component isn't found among its children yet. `block_on` is safe:
+    /// ProjFS callbacks run on their own worker threads, never a tokio one.
+    fn locate(&self, comps: &[String]) -> Option<Located> {
+        let mut ino = inode::ROOT;
+        for (i, comp) in comps.iter().enumerate() {
+            let (sid, _) = inode::unpack(ino);
+            if sid != SYNTHETIC {
+                return Some(Located::Snapshot(sid, comps[i..].join("/")));
+            }
+            let found = view::synthetic_child(&self.tree.read(), ino, comp);
+            let child = match found {
+                Some(node) => node.ino,
+                None if view::needs_naming(&self.tree, ino) => {
+                    self.ensure_named(ino)?;
+                    view::synthetic_child(&self.tree.read(), ino, comp)?.ino
+                }
+                None => return None,
+            };
+            ino = child;
+        }
+        let (sid, _) = inode::unpack(ino);
+        Some(if sid == SYNTHETIC {
+            Located::Synthetic(ino)
+        } else {
+            Located::Snapshot(sid, String::new())
+        })
+    }
+
+    fn ensure_named(&self, dir: Ino) -> Option<()> {
+        match self.handle.block_on(view::ensure_named(&self.tree, dir)) {
+            Ok(()) => Some(()),
+            Err(e) => {
+                tracing::error!(%e, "projfs naming snapshots failed");
+                None
+            }
+        }
+    }
+
+    /// Resolve snapshot `sid`, driving a lazy opener on first access.
+    fn resolve(&self, sid: inode::SnapshotId) -> Option<Arc<SnapshotEntry<C>>> {
         match view::slot_lookup(&self.tree, sid) {
             SlotLookup::Ready(entry) => Some(entry),
             SlotLookup::Pending(lazy) => {
@@ -47,7 +85,7 @@ impl<C: ChunkStore + 'static> ProjFsSource<C> {
                 )) {
                     Ok(entry) => Some(entry),
                     Err(e) => {
-                        tracing::warn!(%e, app, depot, gid, "projfs lazy resolve failed");
+                        tracing::warn!(%e, sid, "projfs lazy resolve failed");
                         None
                     }
                 }
@@ -64,22 +102,6 @@ fn components(path: &Path) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-fn parse_triple(comps: &[String]) -> Option<(u32, u32, u64)> {
-    let app = comps.first()?.parse().ok()?;
-    let depot = comps.get(1)?.parse().ok()?;
-    let gid = comps.get(2)?.parse().ok()?;
-    Some((app, depot, gid))
-}
-
-/// `""`, `"/app"` or `"/app/depot"` — the key `MountTree` indexes by.
-fn synthetic_prefix(comps: &[String]) -> String {
-    if comps.is_empty() {
-        String::new()
-    } else {
-        format!("/{}", comps.join("/"))
-    }
 }
 
 fn dir_meta() -> Metadata {
@@ -104,64 +126,51 @@ fn file_meta(m: &FileMeta, creation_unix: u32) -> Metadata {
 
 impl<C: ChunkStore + Send + Sync + 'static> Filesystem for ProjFsSource<C> {
     fn list_directory(&self, path: &Path) -> Vec<DirEntry> {
-        let comps = components(path);
-
-        // Prefix levels (root / app / depot) live in the synthetic tree.
-        if comps.len() < 3 {
-            let prefix = synthetic_prefix(&comps);
-            let Some(names) = self.tree.read().synthetic_children_at(&prefix) else {
-                return vec![];
-            };
-            return names
-                .into_iter()
-                .map(|name| DirEntry {
-                    name,
-                    metadata: dir_meta(),
-                })
-                .collect();
-        }
-
-        let Some((app, depot, gid)) = parse_triple(&comps) else {
-            return vec![];
-        };
-        let Some(entry) = self.resolve(app, depot, gid) else {
-            return vec![];
-        };
-        let rest = comps[3..].join("/");
-        let creation = entry.snapshot.manifest().creation_time;
-        match entry.snapshot.list_dir(&rest) {
-            Ok(entries) => entries
-                .into_iter()
-                .map(|e| DirEntry {
-                    name: e.name,
-                    metadata: file_meta(&e.meta, creation),
-                })
-                .collect(),
-            Err(_) => vec![],
+        match self.locate(&components(path)) {
+            Some(Located::Synthetic(ino)) => {
+                if view::needs_naming(&self.tree, ino) && self.ensure_named(ino).is_none() {
+                    return vec![];
+                }
+                let tree = self.tree.read();
+                let Some(dir) = tree.synthetic(ino) else {
+                    return vec![];
+                };
+                dir.children
+                    .keys()
+                    .map(|name| DirEntry {
+                        name: name.clone(),
+                        metadata: dir_meta(),
+                    })
+                    .collect()
+            }
+            Some(Located::Snapshot(sid, rest)) => {
+                let Some(entry) = self.resolve(sid) else {
+                    return vec![];
+                };
+                let creation = entry.snapshot.manifest().creation_time;
+                match entry.snapshot.list_dir(&rest) {
+                    Ok(entries) => entries
+                        .into_iter()
+                        .map(|e| DirEntry {
+                            name: e.name,
+                            metadata: file_meta(&e.meta, creation),
+                        })
+                        .collect(),
+                    Err(_) => vec![],
+                }
+            }
+            None => vec![],
         }
     }
 
     fn get_metadata(&self, path: &Path) -> Option<Metadata> {
-        let comps = components(path);
-        match comps.len() {
-            0 => Some(dir_meta()),
-            1 | 2 => {
-                let prefix = synthetic_prefix(&comps);
-                self.tree
-                    .read()
-                    .synthetic_children_at(&prefix)
-                    .map(|_| dir_meta())
-            }
-            // A registered `<gid>` is a dir without opening the manifest —
-            // mirrors the NFS back end's lazy `getattr`.
-            3 => {
-                let (app, depot, gid) = parse_triple(&comps)?;
-                self.tree.read().find(app, depot, gid).map(|_| dir_meta())
-            }
-            _ => {
-                let (app, depot, gid) = parse_triple(&comps)?;
-                let entry = self.resolve(app, depot, gid)?;
-                let rest = comps[3..].join("/");
+        match self.locate(&components(path))? {
+            Located::Synthetic(_) => Some(dir_meta()),
+            // A registered snapshot root is a dir without opening the
+            // manifest — mirrors the NFS back end's lazy `getattr`.
+            Located::Snapshot(_, rest) if rest.is_empty() => Some(dir_meta()),
+            Located::Snapshot(sid, rest) => {
+                let entry = self.resolve(sid)?;
                 let meta = entry.snapshot.metadata(&rest).ok()?;
                 Some(file_meta(&meta, entry.snapshot.manifest().creation_time))
             }
@@ -169,16 +178,19 @@ impl<C: ChunkStore + Send + Sync + 'static> Filesystem for ProjFsSource<C> {
     }
 
     fn read_file(&self, path: &Path, offset: u64, length: u32) -> std::io::Result<Vec<u8>> {
-        let comps = components(path);
-        if comps.len() < 4 {
-            return Ok(Vec::new());
-        }
-        let (app, depot, gid) = parse_triple(&comps)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "not a depot path"))?;
-        let entry = self.resolve(app, depot, gid).ok_or_else(|| {
+        let (sid, rest) = match self.locate(&components(path)) {
+            Some(Located::Snapshot(sid, rest)) if !rest.is_empty() => (sid, rest),
+            Some(_) => return Ok(Vec::new()),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "not a depot path",
+                ));
+            }
+        };
+        let entry = self.resolve(sid).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "snapshot not found")
         })?;
-        let rest = comps[3..].join("/");
 
         let meta = entry.snapshot.metadata(&rest)?;
         if !matches!(meta.kind, FileType::File) {

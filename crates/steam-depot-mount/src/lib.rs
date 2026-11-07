@@ -6,6 +6,10 @@
 //! /<mountpoint>/<app_id>/<depot_id>/<manifest_gid>/<file path inside depot>
 //! ```
 //!
+//! Snapshots registered with `add_lazy_named` sit at
+//! `/<app name>/<depot_id>/<name>` instead, their names decided when the
+//! depot dir is first listed.
+//!
 //! Snapshots can be added and removed at runtime — adds are visible
 //! immediately; removes drop the subtree from new lookups and reject
 //! reads against any inodes that referenced it.
